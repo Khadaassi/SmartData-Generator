@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
 
     embeddings_provider: str = "ollama"
-    embeddings_model: str = "mxbai-embed-large"
+    embeddings_model: str = "bge-m3"
     embeddings_base_url: str = "http://localhost:11434"
 
     documents_storage_dir: str = "./data/documents"

@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from functools import lru_cache
 
 import chromadb
@@ -5,6 +6,7 @@ from chromadb.api.models.Collection import Collection
 
 from infrastructure.config import get_settings
 from infrastructure.embeddings import get_embeddings
+from rag.schemas import ChunkMetadata
 
 
 @lru_cache
@@ -18,12 +20,53 @@ def get_collection() -> Collection:
     return get_chroma_client().get_or_create_collection(settings.chroma_collection_name)
 
 
-def add_texts(texts: list[str], ids: list[str], metadatas: list[dict] | None = None) -> None:
+def _chunk_id(metadata: ChunkMetadata) -> str:
+    return f"{metadata.project_id}:{metadata.document_id}:{metadata.chunk_index}"
+
+
+def upsert_chunks(chunks: list[tuple[str, ChunkMetadata]]) -> int:
+    """Génère les embeddings et indexe (ou met à jour) des chunks dans ChromaDB.
+
+    Les identifiants sont déterministes (projet/document/index) : ré-indexer un
+    corpus inchangé met simplement à jour les mêmes entrées au lieu de les dupliquer.
+    """
+    if not chunks:
+        return 0
+
+    texts = [text for text, _ in chunks]
+    metadatas = [metadata for _, metadata in chunks]
+    ids = [_chunk_id(metadata) for metadata in metadatas]
     embeddings = get_embeddings().embed_documents(texts)
-    get_collection().add(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadatas)
+
+    get_collection().upsert(
+        ids=ids,
+        documents=texts,
+        embeddings=embeddings,
+        metadatas=[metadata.to_chroma_metadata() for metadata in metadatas],
+    )
+    return len(ids)
 
 
-def similarity_search(query: str, k: int = 5) -> list[str]:
+@dataclass
+class SearchResult:
+    text: str
+    metadata: ChunkMetadata
+    distance: float
+
+
+def search(query: str, project_id: str, k: int = 5, entity: str | None = None) -> list[SearchResult]:
+    """Recherche sémantique dans le corpus indexé d'un projet, filtrable par entité."""
+    where = {"project_id": project_id} if entity is None else {"$and": [{"project_id": project_id}, {"entity": entity}]}
+
     query_embedding = get_embeddings().embed_query(query)
-    results = get_collection().query(query_embeddings=[query_embedding], n_results=k)
-    return results["documents"][0] if results["documents"] else []
+    results = get_collection().query(query_embeddings=[query_embedding], n_results=k, where=where)
+
+    if not results["documents"] or not results["documents"][0]:
+        return []
+
+    return [
+        SearchResult(text=text, metadata=ChunkMetadata.model_validate(metadata), distance=distance)
+        for text, metadata, distance in zip(
+            results["documents"][0], results["metadatas"][0], results["distances"][0], strict=True
+        )
+    ]
