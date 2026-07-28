@@ -8,15 +8,21 @@ Copier [.env.example](.env.example) vers `.env` et renseigner `LLM_API_KEY` (cl�
 Deux services externes sont nécessaires en local :
 
 * **ChromaDB** (base vectorielle du RAG) : `docker compose -f docker/docker-compose.yml up -d`, exposé sur `http://localhost:8020`.
-* **Ollama** (embeddings, exécuté en local ou via un autre conteneur) : doit tourner sur `http://localhost:11434` avec le modèle `mxbai-embed-large` disponible (`ollama pull mxbai-embed-large`).
+* **Ollama** (embeddings, exécuté en local ou via un autre conteneur) : doit tourner sur `http://localhost:11434` avec le modèle `bge-m3` disponible (`ollama pull bge-m3`). Multilingue : testé et préféré à `mxbai-embed-large`, qui discrimine mal les phrases françaises proches sémantiquement (2 requêtes de test sur 4 mal classées).
 
 > Le package complet `chromadb` ne s'installe pas sur macOS x86_64 + Python 3.12 (pas de wheel `onnxruntime` compatible). Le projet utilise donc `chromadb-client` (client HTTP léger, sans `onnxruntime`) pour se connecter à un serveur Chroma lancé via Docker plutôt qu'un client embarqué/persistant local.
 
 Vérification (`uv run pytest`) :
 
-* [tests/test_langgraph_smoke.py](tests/test_langgraph_smoke.py) : toujours exécuté, ne dépend d'aucun service externe.
-* [tests/integration/test_chroma.py](tests/integration/test_chroma.py) : exécuté si Chroma et Ollama sont accessibles, sinon *skip*.
+* [tests/test_langgraph_smoke.py](tests/test_langgraph_smoke.py), [tests/test_rag_corpus.py](tests/test_rag_corpus.py) : toujours exécutés, ne dépendent d'aucun service externe.
+* [tests/integration/test_indexing.py](tests/integration/test_indexing.py), [tests/integration/test_search_relevance.py](tests/integration/test_search_relevance.py) : exécutés si Chroma et Ollama sont accessibles, sinon *skip*.
 * [tests/integration/test_groq.py](tests/integration/test_groq.py) : exécuté si `LLM_API_KEY` est renseignée dans `.env`, sinon *skip*.
+
+### Indexation et recherche RAG
+
+* `rag/ingestion.py` : lit un corpus de documents Markdown (cf. [rag/corpus/README.md](rag/corpus/README.md)), nettoie et découpe le contenu, produit les métadonnées par chunk.
+* `rag/indexing.py::index_corpus(corpus_dir, project_id)` : ingère puis indexe (upsert, idempotent) un corpus dans ChromaDB.
+* `rag/vectorstore.py::search(query, project_id, k, entity)` : recherche sémantique filtrée par projet (et éventuellement par entité), retourne texte + métadonnées + score de distance.
 
 ## Versioning
 
