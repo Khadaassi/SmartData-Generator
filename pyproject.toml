@@ -15,4 +15,17 @@ dependencies = [
 dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.0",
+    "python-semantic-release>=10.6.1",
 ]
+
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+tag_format = "v{version}"
+major_on_zero = false
+commit_parser = "conventional"
+
+[tool.semantic_release.branches.main]
+match = "main"
+
+[tool.semantic_release.changelog.default_templates]
+changelog_file = "CHANGELOG.md"
