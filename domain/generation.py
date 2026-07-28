@@ -2,7 +2,9 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from domain.rules import BusinessRule
 from domain.schema import EntitySpec
+from validation.schemas import ValidationReport
 
 GenerationStatus = Literal["PENDING", "SUCCESS", "FAILED"]
 
@@ -14,6 +16,7 @@ class GenerationRequest(BaseModel):
     entity: EntitySpec
     count: int = Field(gt=0, le=_MAX_COUNT)
     context_query: str | None = None
+    rules: list[BusinessRule] = Field(default_factory=list)
 
 
 class GenerationError(BaseModel):
@@ -30,3 +33,4 @@ class GenerationResult(BaseModel):
     items: list[dict]
     rules_used: list[str]
     errors: list[GenerationError]
+    validation_report: ValidationReport | None = None

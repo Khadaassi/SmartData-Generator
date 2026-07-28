@@ -5,9 +5,11 @@ from agents.generation_agent import (
     GenerationState,
     _generate_data,
     _retrieve_context,
+    _validate_data,
     run_generation,
 )
 from domain.generation import GenerationRequest
+from domain.rules import BusinessRule
 from domain.schema import EntitySpec, FieldSpec, build_entity_model
 from rag.schemas import ChunkMetadata
 from rag.vectorstore import SearchResult
@@ -32,6 +34,7 @@ def _initial_state(request: GenerationRequest) -> GenerationState:
         "items": [],
         "errors": [],
         "status": "PENDING",
+        "validation_report": None,
     }
 
 
@@ -155,3 +158,54 @@ def test_run_generation_end_to_end_with_fakes(monkeypatch):
     assert result.items == items_data
     assert result.rules_used == ["Le prix doit toujours être positif."]
     assert result.errors == []
+    assert result.validation_report is not None
+    assert result.validation_report.status == "PASSED"
+
+
+def test_validate_data_node_rejects_items_violating_business_rules():
+    rule = BusinessRule(id="prix-positif", name="Prix positif", type="range", field="prix", min_value=0, exclusive_min=True)
+    request = _make_request(count=2)
+    request = request.model_copy(update={"rules": [rule]})
+
+    state = _initial_state(request)
+    state["items"] = [{"nom": "Clavier", "prix": 29.9}, {"nom": "Souris", "prix": -5.0}]
+
+    result_state = _validate_data(state)
+
+    assert result_state["status"] == "SUCCESS"  # un objet valide subsiste
+    assert result_state["items"] == [{"nom": "Clavier", "prix": 29.9}]
+    assert result_state["validation_report"].status == "PARTIAL"
+    assert result_state["validation_report"].rejected_items == 1
+    assert any(error.stage == "validation" and error.blocking for error in result_state["errors"])
+
+
+def test_validate_data_node_fails_when_every_item_is_rejected():
+    rule = BusinessRule(id="prix-positif", name="Prix positif", type="range", field="prix", min_value=0, exclusive_min=True)
+    request = _make_request(count=1).model_copy(update={"rules": [rule]})
+
+    state = _initial_state(request)
+    state["items"] = [{"nom": "Clavier", "prix": -5.0}]
+
+    result_state = _validate_data(state)
+
+    assert result_state["status"] == "FAILED"
+    assert result_state["items"] == []
+    assert result_state["validation_report"].status == "FAILED"
+
+
+def test_run_generation_end_to_end_rejects_invalid_items_via_validation(monkeypatch):
+    monkeypatch.setattr("agents.generation_agent.search", lambda *a, **k: [])
+
+    items_data = [{"nom": "Clavier", "prix": 29.9}, {"nom": "Souris", "prix": -5.0}]
+    monkeypatch.setattr("agents.generation_agent.get_llm", lambda: _FakeLLM(items_data))
+
+    rule = BusinessRule(id="prix-positif", name="Prix positif", type="range", field="prix", min_value=0, exclusive_min=True)
+    request = _make_request(count=2).model_copy(update={"rules": [rule]})
+
+    result = run_generation(request)
+
+    assert result.status == "SUCCESS"
+    assert result.items == [{"nom": "Clavier", "prix": 29.9}]
+    assert result.validation_report.status == "PARTIAL"
+    assert result.validation_report.rejected_items == 1
+    assert any("prix" in error.message for error in result.errors if error.stage == "validation")

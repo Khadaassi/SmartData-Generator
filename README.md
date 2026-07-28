@@ -24,6 +24,12 @@ Vérification (`uv run pytest`) :
 * `rag/indexing.py::index_corpus(corpus_dir, project_id)` : ingère puis indexe (upsert, idempotent) un corpus dans ChromaDB.
 * `rag/vectorstore.py::search(query, project_id, k, entity)` : recherche sémantique filtrée par projet (et éventuellement par entité), retourne texte + métadonnées + score de distance.
 
+### Agent de génération et validation
+
+* `agents/generation_agent.py::run_generation(request)` : workflow LangGraph — recherche RAG (contexte métier en texte libre pour le LLM) → génération structurée (sortie contrainte par un modèle Pydantic dynamique, `domain/schema.py::build_entity_model`) → validation déterministe → finalisation. Erreurs classées bloquantes/non bloquantes à chaque étape, journalisées avec un `run_id` de corrélation.
+* `domain/rules.py::BusinessRule` : règles métier codées (types `range`, `allowed_values`, `unique`, `date_order`), distinctes des documents RAG en texte libre — nécessaires car le LLM ne doit pas être l'unique mécanisme de validation.
+* `validation/engine.py::validate_batch(entity, items, rules)` : revalide les types (Pydantic) puis les règles métier ; rejette les objets en erreur bloquante, produit un `ValidationReport` détaillé (`PASSED` / `PASSED_WITH_WARNINGS` / `PARTIAL` / `FAILED`).
+
 ## Versioning
 
 Le projet suit [Semantic Versioning](https://semver.org/lang/fr/) (`MAJOR.MINOR.PATCH`) et le versioning est **automatisé** via [python-semantic-release](https://python-semantic-release.readthedocs.io/) sur la branche `main`.
