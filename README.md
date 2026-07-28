@@ -1,6 +1,23 @@
 # SmartData-Generator
 AI-powered Business Data Generator
 
+## Stack IA (local)
+
+Copier [.env.example](.env.example) vers `.env` et renseigner `LLM_API_KEY` (clé [Groq](https://console.groq.com/keys)).
+
+Deux services externes sont nécessaires en local :
+
+* **ChromaDB** (base vectorielle du RAG) : `docker compose -f docker/docker-compose.yml up -d`, exposé sur `http://localhost:8020`.
+* **Ollama** (embeddings, exécuté en local ou via un autre conteneur) : doit tourner sur `http://localhost:11434` avec le modèle `mxbai-embed-large` disponible (`ollama pull mxbai-embed-large`).
+
+> Le package complet `chromadb` ne s'installe pas sur macOS x86_64 + Python 3.12 (pas de wheel `onnxruntime` compatible). Le projet utilise donc `chromadb-client` (client HTTP léger, sans `onnxruntime`) pour se connecter à un serveur Chroma lancé via Docker plutôt qu'un client embarqué/persistant local.
+
+Vérification (`uv run pytest`) :
+
+* [tests/test_langgraph_smoke.py](tests/test_langgraph_smoke.py) : toujours exécuté, ne dépend d'aucun service externe.
+* [tests/integration/test_chroma.py](tests/integration/test_chroma.py) : exécuté si Chroma et Ollama sont accessibles, sinon *skip*.
+* [tests/integration/test_groq.py](tests/integration/test_groq.py) : exécuté si `LLM_API_KEY` est renseignée dans `.env`, sinon *skip*.
+
 ## Versioning
 
 Le projet suit [Semantic Versioning](https://semver.org/lang/fr/) (`MAJOR.MINOR.PATCH`) et le versioning est **automatisé** via [python-semantic-release](https://python-semantic-release.readthedocs.io/) sur la branche `main`.
