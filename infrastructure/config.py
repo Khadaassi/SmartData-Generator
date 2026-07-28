@@ -18,17 +18,17 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+psycopg://smartdata:smartdata@localhost:5432/smartdata_generator"
 
-    chroma_persist_dir: str = "./data/chroma"
+    chroma_host: str = "localhost"
+    chroma_port: int = 8020
     chroma_collection_name: str = "smartdata_generator"
 
-    llm_provider: str = "openai"
-    llm_model: str = "gpt-4o-mini"
+    llm_provider: str = "groq"
+    llm_model: str = "llama-3.3-70b-versatile"
     llm_api_key: str = ""
-    llm_base_url: str = ""
 
-    embeddings_provider: str = "openai"
-    embeddings_model: str = "text-embedding-3-small"
-    embeddings_api_key: str = ""
+    embeddings_provider: str = "ollama"
+    embeddings_model: str = "mxbai-embed-large"
+    embeddings_base_url: str = "http://localhost:11434"
 
     documents_storage_dir: str = "./data/documents"
     export_output_dir: str = "./data/exports"
