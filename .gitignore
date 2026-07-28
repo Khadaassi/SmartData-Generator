@@ -157,6 +157,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Stockage local (ChromaDB, documents, exports) - cf. .env.example
+/data/
+
 # Spyder project settings
 .spyderproject
 .spyproject
