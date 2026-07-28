@@ -1,6 +1,9 @@
 from dataclasses import dataclass
 
-from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+from langchain_text_splitters import (
+    MarkdownHeaderTextSplitter,
+    RecursiveCharacterTextSplitter,
+)
 
 _HEADERS_TO_SPLIT_ON = [("##", "section")]
 _CHUNK_SIZE = 800
