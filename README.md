@@ -30,6 +30,48 @@ Vérification (`uv run pytest`) :
 * `domain/rules.py::BusinessRule` : règles métier codées (types `range`, `allowed_values`, `unique`, `date_order`), distinctes des documents RAG en texte libre — nécessaires car le LLM ne doit pas être l'unique mécanisme de validation.
 * `validation/engine.py::validate_batch(entity, items, rules)` : revalide les types (Pydantic) puis les règles métier ; rejette les objets en erreur bloquante, produit un `ValidationReport` détaillé (`PASSED` / `PASSED_WITH_WARNINGS` / `PARTIAL` / `FAILED`).
 
+## Interface utilisateur Streamlit
+
+SmartData Generator fournit une interface Streamlit destinée à un utilisateur métier non technique.
+
+L'interface consomme uniquement l'API FastAPI ([health](api/routers/health.py), [schema/postgres](api/routers/schema_analysis.py), [executions](api/routers/executions.py)) et n'accède jamais directement au LLM, à ChromaDB, à Ollama ou à PostgreSQL : elle est un pur client HTTP (`streamlit_app/api_client.py`), remplaçable sans impact sur le moteur.
+
+Démarrer l'API :
+
+```bash
+uv run uvicorn api.app:app --host 0.0.0.0 --port 8000
+```
+
+Démarrer l'interface :
+
+```bash
+uv run streamlit run streamlit_app/app.py
+```
+
+Ouvrir [http://localhost:8501](http://localhost:8501).
+
+Parcours proposé (pages `Project` → `Schema` → `Generation` → `Result`) :
+
+1. sélectionner un projet (`project_id`, ex. `pricing-control-tower-demo` pour la démonstration) ;
+2. analyser un schéma PostgreSQL cible et consulter tables, colonnes, contraintes et ordre de génération ;
+3. sélectionner une entité, choisir le nombre d'enregistrements, puis lancer une exécution en mode **Preview** (par défaut), **Export CSV/JSON** ou **Insert PostgreSQL** — ce dernier exige une cible explicite et une confirmation cochée, jamais implicite ;
+4. consulter le résultat : `run_id`, statistiques, données valides, rapport de validation et rapport d'insertion/export.
+
+Configuration (`.env`, cf. [.env.example](.env.example)) :
+
+```dotenv
+STREAMLIT_API_BASE_URL=http://localhost:8000
+STREAMLIT_REQUEST_TIMEOUT=120
+```
+
+Tests (`streamlit_app` ne dépend d'aucun service externe pour ses tests, `httpx.MockTransport` simule l'API) :
+
+```bash
+uv run pytest tests/test_streamlit_api_client.py tests/test_streamlit_payloads.py tests/test_streamlit_error_mapping.py -v
+```
+
+Scénario de validation manuelle (avec Pricing Control Tower comme projet de démonstration) : [docs/03_validation/streamlit_interface_validation.md](docs/03_validation/streamlit_interface_validation.md).
+
 ## Versioning
 
 Le projet suit [Semantic Versioning](https://semver.org/lang/fr/) (`MAJOR.MINOR.PATCH`) et le versioning est **automatisé** via [python-semantic-release](https://python-semantic-release.readthedocs.io/) sur la branche `main`.
