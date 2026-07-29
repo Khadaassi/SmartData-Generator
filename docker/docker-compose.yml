@@ -1,0 +1,28 @@
+services:
+  chromadb:
+    image: ghcr.io/chroma-core/chroma:latest
+    restart: unless-stopped
+    environment:
+      - IS_PERSISTENT=TRUE
+    ports:
+      - "8020:8000"
+    volumes:
+      - chroma-data:/chroma/chroma
+
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=smartdata
+      - POSTGRES_PASSWORD=smartdata
+      - POSTGRES_DB=smartdata_generator
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  chroma-data:
+    driver: local
+  postgres-data:
+    driver: local
