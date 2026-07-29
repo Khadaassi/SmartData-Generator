@@ -2,2389 +2,711 @@
 
 ## Architecture technique globale
 
-**Version :** 1.0
-**Statut :** Draft
+**Version :** 2.0
+**Statut :** Validé — reflète l'implémentation réelle
 **Projet :** SmartData Generator
 **Type de projet :** Proof of Concept industrialisable
 **Contexte :** Certification RNCP Développeur en Intelligence Artificielle
+**Dernière mise à jour :** 2026-07-29
+
+---
+
+## Note de révision (v2.0)
+
+La version 1.0 de ce document a été rédigée pendant le cadrage (T1), avant l'implémentation. Elle décrivait une architecture *cible* : un orchestrateur LangGraph unique couvrant l'intégralité du workflow (chargement du projet, analyse de schéma, RAG, planification, génération, validation, Preview/Export/Insert), des services applicatifs séparés pour chaque responsabilité (Project, Document, Schema, Export, Insert), un Connector Registry avec interfaces abstraites, un Generation Planner distinct de l'exécution.
+
+Cette version 2.0 documente **l'architecture telle qu'elle a été effectivement implémentée** à l'issue du développement. Les choix retenus en pratique sont plus simples que la cible initiale, pour des raisons données à chaque section concernée (§20). Les écarts principaux :
+
+| Cadrage (v1.0) | Implémentation réelle (v2.0) |
+|---|---|
+| Un LangGraph unique orchestrant tout le cycle (schéma → RAG → plan → génération → validation → écriture) | Deux niveaux distincts : `execution_service.py` est un **dispatcher Python simple** (Preview/Export/Insert) ; LangGraph n'orchestre que le **micro-workflow de génération** (RAG → LLM → validation), dans `agents/generation_agent.py` |
+| Generation Planner produisant un plan structuré séparé de l'exécution | Pas de plan intermédiaire : le prompt est construit directement à partir du schéma et du contexte RAG (`prompts/generation.py`), puis envoyé au LLM en sortie structurée |
+| Project Service / Document Service / Schema Service pilotant le workflow | `application/project_service.py` gère le cycle de vie d'un projet (CRUD), mais **n'est pas encore relié** à `execution_service.py` : une exécution reçoit son entité et ses règles directement dans la requête, pas via un projet chargé automatiquement |
+| Connector Registry + interfaces abstraites (`BaseConnector`, `DataWriter`, ...) | Connecteurs = modules de fonctions simples (`connectors/input/`, `connectors/output/`, `connectors/postgres/`), appelés directement par leur nom, sans registre ni classes abstraites |
+| Analyse de schéma intégrée au workflow de génération | `/schema/postgres` est un endpoint autonome, non enchaîné à `/executions` : l'analyse de schéma et la génération sont deux capacités indépendantes aujourd'hui |
+| Statuts `PENDING`, `RUNNING`, `WAITING_FOR_INPUT` | Non implémentés : l'exécution est synchrone (requête HTTP → réponse), il n'y a pas de step "en cours" observable ni de mécanisme de clarification interactif |
+
+Le reste de ce document décrit l'architecture réelle en détail, section par section, avec le code source comme référence (chemins de fichiers indiqués partout). La correspondance avec les cas d'usage de [`user_cases.md`](../01_framing/user_cases.md) reste valable pour Preview/Export/Insert (§6, §7, §12) ; elle ne l'est plus pour les cas d'usage UC-04 à UC-11 (schéma, RAG, plan, génération orchestrée de bout en bout), qui décrivent la cible et non l'état actuel.
 
 ---
 
 # 1. Introduction
 
-Ce document décrit l’architecture technique globale de SmartData Generator.
+SmartData Generator est un service d'intelligence artificielle indépendant conçu pour générer des données métier synthétiques, cohérentes et validées à partir :
 
-SmartData Generator est un service d’intelligence artificielle indépendant conçu pour générer des données métier synthétiques, cohérentes et validées à partir :
+* d'un schéma cible (fourni explicitement dans la requête, ou analysé séparément depuis PostgreSQL) ;
+* de règles métier (déterministes, `BusinessRule`, ou documentaires via RAG) ;
+* de documentation métier (corpus Markdown indexé dans ChromaDB) ;
+* de paramètres de génération (volume, contexte).
 
-* d’un schéma cible ;
-* de règles métier ;
-* d’une documentation métier ;
-* de paramètres de génération ;
-* de données existantes lorsque leur lecture est autorisée.
-
-L’architecture doit permettre de réutiliser le service dans différents domaines fonctionnels sans modifier son cœur.
-
-Aucune logique métier spécifique à Pricing Control Tower ne doit être intégrée dans SmartData Generator.
-
-Pricing Control Tower constitue uniquement un démonstrateur du service.
+Le cœur du service (génération, validation, connecteurs) ne contient aucune logique propre à un domaine métier particulier. Pricing Control Tower constitue un démonstrateur, pas une dépendance.
 
 ---
 
-# 2. Objectifs de l’architecture
+# 2. Objectifs de l'architecture
 
-L’architecture doit permettre de :
+L'architecture doit permettre de :
 
 * séparer clairement les responsabilités ;
-* rendre les composants indépendants ;
-* remplacer facilement un fournisseur LLM ;
-* remplacer facilement un fournisseur d’embeddings ;
-* ajouter de nouveaux connecteurs ;
-* isoler le moteur IA des systèmes externes ;
-* analyser les schémas de manière déterministe ;
-* exploiter la documentation métier grâce à un RAG ;
-* produire des sorties structurées ;
+* remplacer facilement un fournisseur LLM ou d'embeddings (accès toujours via `infrastructure/llm.py` et `infrastructure/embeddings.py`) ;
+* ajouter de nouveaux connecteurs sans modifier le moteur ;
+* produire des sorties LLM structurées et validées par Pydantic ;
 * valider les données avant toute écriture ;
 * garantir une confirmation explicite avant insertion ;
-* tracer chaque exécution ;
-* faciliter les tests ;
-* permettre une industrialisation progressive.
+* tracer chaque exécution (rapport persistant, `run_id` unique) ;
+* faciliter les tests (mocks via `monkeypatch`, tests d'intégration isolés par disponibilité des services externes).
 
 ---
 
-# 3. Principes d’architecture
+# 3. Principes d'architecture réellement appliqués
 
-## 3.1 Architecture modulaire
+## 3.1 Séparation en couches
 
-L’application est découpée en modules spécialisés.
+Le code est organisé en modules Python à responsabilité unique (détail réel en §23) :
 
-Chaque module possède une responsabilité clairement définie.
+* `api/` — HTTP uniquement (FastAPI) ;
+* `application/` — cas d'usage (`execution_service`, `project_service`) ;
+* `domain/` — modèles Pydantic purs, sans dépendance technique ;
+* `agents/` — le micro-workflow LangGraph de génération ;
+* `rag/`, `validation/`, `connectors/`, `persistence/`, `reporting/`, `infrastructure/` — composants techniques spécialisés.
 
-Les principaux modules sont :
+## 3.2 Domaine indépendant de l'infrastructure
 
-* API ;
-* services applicatifs ;
-* orchestration LangGraph ;
-* analyse du schéma ;
-* RAG ;
-* intégration LLM ;
-* génération ;
-* validation ;
-* connecteurs ;
-* export ;
-* insertion ;
-* reporting ;
-* stockage interne.
+`domain/*.py` ne dépend d'aucun connecteur, d'aucun client HTTP, d'aucune base de données : uniquement de Pydantic et d'autres modules `domain`. C'est ce qui permet de tester `application/execution_service.py` en substituant `run_generation`, `insert_records`, `write_csv`/`write_json` par des fonctions factices sans jamais toucher un réseau ou une base (voir `tests/test_execution_service.py`).
 
----
+## 3.3 Preview par défaut, écriture jamais implicite
 
-## 3.2 Séparation des responsabilités
+`ExecutionRequest.mode` vaut `"PREVIEW"` par défaut (`domain/execution.py`). Le mode Insert exige à la fois `insert_target` (destination explicite) **et** `confirm_insert=True` (confirmation explicite) — l'absence de l'un ou l'autre produit un statut `FAILED` avec un code d'erreur explicite, sans qu'aucune écriture n'ait lieu (`application/execution_service.py::_execute_insert`).
 
-Les responsabilités doivent rester séparées.
+## 3.4 Validation déterministe avant toute écriture
 
-L’API reçoit les requêtes mais ne génère pas les données.
+`validation/engine.py::validate_batch` revalide chaque objet généré contre le modèle Pydantic dynamique de l'entité (`domain/schema.py::build_entity_model`), puis applique les règles métier structurées (`domain/rules.py::BusinessRule` : `range`, `allowed_values`, `unique`, `date_order`). Le LLM ne participe à aucune étape de validation : la validation est 100 % déterministe.
 
-L’agent orchestre les étapes mais n’écrit pas directement dans une destination.
+## 3.5 Le LLM ne déclenche jamais d'écriture
 
-Le RAG fournit les règles métier mais ne détermine pas le schéma technique.
+Le LLM (`infrastructure/llm.py`) n'est appelé que dans `agents/generation_agent.py::_generate_data`, pour produire les objets d'une entité en sortie structurée (`with_structured_output`). Il n'a accès à aucun connecteur, ne construit aucune requête SQL, et ne peut pas décider seul d'un Export ou d'un Insert — ces opérations sont déclenchées par l'appelant de l'API, pas par le LLM.
 
-Le Schema Analyzer décrit le schéma mais n’interprète pas les règles métier.
+## 3.6 Traçabilité systématique
 
-Les connecteurs lisent ou écrivent les données mais ne contiennent aucune logique IA.
-
-Le Validation Engine contrôle les données mais ne décide pas de leur insertion.
-
-L’Insert Service exécute l’écriture uniquement après autorisation explicite.
+Chaque appel à `execute()` produit un `ExecutionReport` (`reporting/report_builder.py`), persisté en base (`reporting/report_service.py::save_execution_report`), **y compris en cas d'échec** — la persistance du rapport est elle-même protégée par un `try/except` pour ne jamais faire échouer une exécution dont le résultat métier est déjà déterminé (`execution_service.py::_record_execution_report`).
 
 ---
 
-## 3.3 Dépendance vers des interfaces abstraites
-
-Les services principaux doivent dépendre d’interfaces et non d’implémentations concrètes.
-
-Le moteur de génération ne doit pas dépendre directement de PostgreSQL, CSV, JSON ou d’une API REST spécifique.
-
-Le moteur doit interagir avec des contrats génériques.
-
-Cette approche permet d’ajouter un nouveau connecteur sans modifier le cœur de l’application.
-
----
-
-## 3.4 Configuration plutôt que code spécifique
-
-Les particularités métier doivent être fournies par :
-
-* le schéma ;
-* la documentation ;
-* les règles métier ;
-* les paramètres de génération ;
-* la configuration du projet.
-
-Aucune règle métier propre à un domaine ne doit être codée directement dans le moteur.
-
----
-
-## 3.5 Preview par défaut
-
-Le mode Preview constitue le comportement par défaut.
-
-Toute génération doit pouvoir être analysée et validée avant une opération d’écriture.
-
-Le mode Export ou Insert ne doit être déclenché qu’après validation.
-
----
-
-## 3.6 Validation humaine avant écriture
-
-Une donnée techniquement valide ne doit pas être insérée automatiquement.
-
-Le système distingue :
-
-* la validation technique ;
-* la validation métier ;
-* l’autorisation d’insertion.
-
-L’utilisateur doit demander explicitement l’insertion.
-
----
-
-## 3.7 Sorties IA structurées
-
-Les réponses critiques du LLM doivent respecter des modèles structurés.
-
-Cela concerne notamment :
-
-* le plan de génération ;
-* les demandes de clarification ;
-* les stratégies de génération ;
-* les données générées par le LLM ;
-* les explications de validation ;
-* les résultats d’exécution.
-
-Les structures doivent être validées avec Pydantic.
-
----
-
-## 3.8 Validation déterministe
-
-Le LLM peut aider à comprendre ou à proposer.
-
-La validation finale doit être réalisée autant que possible avec des mécanismes déterministes.
-
-Le LLM ne doit pas être l’unique source de validation.
-
----
-
-## 3.9 Traçabilité
-
-Chaque exécution doit posséder un identifiant unique.
-
-Les principales étapes doivent être enregistrées :
-
-* création de l’exécution ;
-* analyse du schéma ;
-* recherche documentaire ;
-* création du plan ;
-* génération ;
-* validation ;
-* export ;
-* insertion ;
-* erreur ;
-* fin de l’exécution.
-
----
-
-# 4. Vue globale de l’architecture
-
-L’architecture est organisée en plusieurs couches.
+# 4. Vue globale de l'architecture réelle
 
 ```text
-API Layer
+API Layer (FastAPI)
     |
     v
 Application Services
     |
+    +-- Project Service ------------------> Persistence Layer (PostgreSQL interne)
+    |
+    +-- Execution Service
+            |
+            +--> Generation Agent (LangGraph, 5 nœuds)
+            |         |
+            |         +--> RAG (ChromaDB + Ollama embeddings)
+            |         +--> LLM Provider (Groq)
+            |         +--> Validation Engine (déterministe)
+            |
+            +--> Export : connectors/output (CSV, JSON)
+            |
+            +--> Insert : connectors/postgres (transaction SQLAlchemy)
+            |
+            +--> Reporting -----------------> Persistence Layer (PostgreSQL interne)
+
+Schema Analysis (endpoint autonome, non enchaîné à Execution Service)
+    |
     v
-LangGraph Orchestrator
-    |
-    +-- Schema Analyzer
-    |
-    +-- RAG Retriever
-    |
-    +-- Generation Planner
-    |
-    +-- Generation Engine
-    |
-    +-- Validation Engine
-    |
-    +-- Execution Reporter
-    |
-    v
-Connector Interfaces
-    |
-    +-- CSV Connector
-    |
-    +-- JSON Connector
-    |
-    +-- REST Connector
-    |
-    +-- PostgreSQL Connector
+connectors/postgres/schema_reader.py
 ```
 
----
-
-# 5. Architecture par plans fonctionnels
-
-## 5.1 Control Plane
-
-Le Control Plane gère les éléments de pilotage du service.
-
-Il contient notamment :
-
-* les projets ;
-* les configurations ;
-* les connexions ;
-* les documents ;
-* les demandes de génération ;
-* les statuts ;
-* les rapports ;
-* les métadonnées d’exécution.
-
-Il ne réalise pas directement la génération.
+Ce schéma diffère volontairement de celui du cadrage : il n'y a **pas** de couche d'orchestration unique au-dessus de tout le service. `Execution Service` (une fonction, pas un agent) appelle directement `run_generation()`, puis directement les connecteurs de sortie selon le mode. Seule la génération elle-même (RAG + LLM + validation) est un graphe LangGraph.
 
 ---
 
-## 5.2 Generation Plane
+# 5. Composants réellement implémentés
 
-Le Generation Plane gère le workflow de génération.
+## 5.1 API Layer — `api/`
 
-Il contient :
+Technologie : FastAPI. Point d'entrée : `api/app.py::create_app()`.
 
-* l’analyse du contexte ;
-* l’analyse du schéma ;
-* la recherche RAG ;
-* la planification ;
-* la génération ;
-* la validation ;
-* les clarifications ;
-* la création du Preview.
+| Fichier | Rôle |
+|---|---|
+| `api/app.py` | Construit l'app FastAPI, enregistre les gestionnaires d'erreurs et les routeurs |
+| `api/routers/health.py` | `GET /health` — statut, version (lue depuis `pyproject.toml`), environnement |
+| `api/routers/executions.py` | `POST /executions` — point d'entrée unique pour Preview/Export/Insert |
+| `api/routers/schema_analysis.py` | `POST /schema/postgres` — analyse d'un schéma PostgreSQL, indépendante d'une exécution |
+| `api/errors.py` | Convertit `SchemaReaderError` en HTTP 502 ; toute exception non prévue devient un 500 générique sans fuite de trace interne |
+| `api/schemas/` | Modèles de requête/réponse propres à l'API (`ErrorResponse`, `HealthResponse`, `PostgresSchemaRequest`) — distincts des modèles `domain/`, pour ne pas coupler le contrat HTTP au modèle métier |
+| `api/dependencies.py` | Injection FastAPI de `Settings` via `Depends(get_settings)` |
 
----
+Aucune route n'existe encore pour la gestion de projets (`ProjectService` n'est pas exposé en HTTP), ni pour l'upload/l'indexation de documents.
 
-## 5.3 Integration Plane
+## 5.2 Execution Service — `application/execution_service.py`
 
-L’Integration Plane gère les échanges avec les systèmes externes.
+Point d'entrée applicatif unique pour les trois modes. Ce n'est **pas** un agent ni un graphe : une fonction `execute(request) -> ExecutionResult` qui :
 
-Il contient :
+1. appelle `run_generation()` (génération + validation) ;
+2. arrête immédiatement si aucune donnée valide n'a survécu (`status="VALIDATION_FAILED"`) ;
+3. selon `request.mode`, retourne le résultat tel quel (`PREVIEW`), écrit un fichier (`EXPORT`, via `connectors/output`), ou insère en base (`INSERT`, via `connectors/postgres`, avec les contrôles explicites de §3.3) ;
+4. construit et persiste systématiquement un `ExecutionReport`.
 
-* les connecteurs ;
-* la lecture des fichiers ;
-* les appels REST ;
-* l’inspection PostgreSQL ;
-* l’export ;
-* l’insertion ;
-* les transactions.
+## 5.3 Project Service — `application/project_service.py`
 
----
+CRUD complet sur `domain/project.py::Project` (créer, lire, lister, mettre à jour la configuration, activer/désactiver, supprimer), adossé à `persistence/project_repository.py`. `ProjectConfig` porte les entités, les règles métier, les paramètres de génération par défaut, et la configuration source/destination — c'est ce qui rend le service réutilisable d'un domaine à l'autre sans changer le code.
 
-# 6. Composants principaux
+**Écart avec le cadrage :** ce service n'est pour l'instant **pas consommé** par `execution_service.py`. Une `GenerationRequest` porte son `entity` et ses `rules` directement, sans passer par `load_project_config()`. Le chaînage Project → Execution reste à faire (§21).
 
-# 6.1 API Layer
+## 5.4 Generation Agent — `agents/generation_agent.py`
 
-L’API Layer expose SmartData Generator aux applications clientes.
+Le seul graphe LangGraph du service. État (`GenerationState`, `TypedDict`) : `run_id`, `request`, `context`, `items`, `errors`, `status`, `validation_report`.
 
-La technologie retenue est FastAPI.
+Nœuds :
 
-## Responsabilités
+| Nœud | Rôle | Erreur associée |
+|---|---|---|
+| `retrieve_context` | Recherche RAG (`rag/vectorstore.py::search`) filtrée par `project_id` et `entity` | `rag_unavailable` (**non bloquant** — la génération continue sans contexte métier) |
+| `generate_data` | Construit un modèle Pydantic dynamique par lot (`{Entity}Batch`), appelle le LLM en sortie structurée | `llm_generation_failed` (bloquant), `incomplete_generation` (non bloquant, si moins d'objets que demandé) |
+| `validate_data` | Appelle `validation/engine.py::validate_batch` | erreurs de validation mappées en `GenerationError`, `blocking = (issue.level == ERROR)` |
+| `finalize` | Nœud terminal en cas de succès | — |
+| `handle_error` | Nœud terminal en cas d'échec bloquant | — |
 
-L’API doit permettre de :
+Routage conditionnel (`_route_on_status`) : après `generate_data` et après `validate_data`, le graphe bifurque vers `handle_error` si `status == "FAILED"`, sinon continue. Le graphe est compilé une seule fois (`@lru_cache` sur `get_generation_graph()`).
 
-* créer un projet ;
-* consulter un projet ;
-* enregistrer une configuration ;
-* associer des documents ;
-* lancer une indexation ;
-* lancer une analyse du schéma ;
-* lancer une génération ;
-* demander un Preview ;
-* demander un Export ;
-* demander un Insert ;
-* consulter une exécution ;
-* récupérer un rapport ;
-* consulter le statut du service.
+## 5.5 Prompt Builder — `prompts/generation.py`
 
-L’API est également responsable de :
+Construit le prompt envoyé au LLM (`build_generation_prompt`) : un message système fixe (rôle, interdiction d'inventer un champ, priorité des règles métier sur la connaissance générale) + un message humain assemblant le nom de l'entité, la liste des champs (nom, type, obligatoire, description), le volume demandé, et les passages RAG récupérés (ou un texte explicite si aucun résultat).
 
-* la validation des requêtes ;
-* la sérialisation des réponses ;
-* la gestion des erreurs HTTP ;
-* la documentation OpenAPI ;
-* l’attribution d’un identifiant de corrélation.
+## 5.6 RAG — `rag/`
 
-## Limites
+| Fichier | Rôle |
+|---|---|
+| `rag/schemas.py` | `DocumentCategory` (definition/rule/constraint/example/relation/convention/limit/exception), `DocumentFrontMatter`, `ChunkMetadata` |
+| `rag/ingestion.py` | Lit un document Markdown, extrait son en-tête YAML (front matter obligatoire : `title`, `category`, `entity`), nettoie et découpe le corps |
+| `rag/chunking.py` | Découpage en deux passes : d'abord par section `##` (`MarkdownHeaderTextSplitter`), puis par taille (`RecursiveCharacterTextSplitter`, 800 caractères, 100 de recouvrement) |
+| `rag/cleaning.py` | Normalisation Unicode (NFC), fins de ligne, espaces superflus |
+| `rag/vectorstore.py` | Client ChromaDB HTTP (`chromadb.HttpClient`), `upsert_chunks` (identifiants déterministes `project_id:document_id:chunk_index`, donc réindexation idempotente) et `search` (filtrée par métadonnées `project_id` + `entity`) |
+| `rag/indexing.py` | `index_corpus` — ingère puis indexe tous les `.md` d'un répertoire pour un projet |
 
-L’API ne doit pas :
+Le corpus est un ensemble de fichiers Markdown avec front matter YAML (exemple : [`rag/corpus/examples/regles_client.md`](../../rag/corpus/examples/regles_client.md)). **Aucun endpoint API n'expose l'upload ou le déclenchement d'indexation** ; ce pipeline est aujourd'hui exercé uniquement par les tests d'intégration et un corpus d'exemple.
 
-* contenir directement la logique IA ;
-* analyser elle-même les schémas ;
-* accéder directement à ChromaDB ;
-* écrire directement dans une base cible ;
-* construire les prompts ;
-* exécuter les règles métier.
+## 5.7 Validation Engine — `validation/`
 
----
+* `validation/schemas.py` : `IssueLevel` (`error`/`warning`), `ValidationIssue`, `ValidationReport` (`status` ∈ `PASSED`, `PASSED_WITH_WARNINGS`, `PARTIAL`, `FAILED`).
+* `validation/engine.py::validate_batch(entity, items, rules)` :
+  1. revalide chaque objet contre le modèle Pydantic de l'entité (types, champs obligatoires) → objets invalides exclus, `type_error` ;
+  2. applique les `BusinessRule` fournies sur les objets restés valides : `range` (bornes inclusives/exclusives), `allowed_values`, `date_order` (comparaison de deux champs ISO 8601), `unique` (détection de doublons sur un champ) ;
+  3. calcule le statut global : `FAILED` si aucun objet valide, `PARTIAL` s'il reste des erreurs mais aussi des objets valides, `PASSED_WITH_WARNINGS` s'il ne reste que des avertissements, `PASSED` sinon.
 
-# 6.2 Application Services
+Aucun appel LLM dans ce module : entièrement déterministe.
 
-Les Application Services implémentent les cas d’usage du service.
+## 5.8 Connecteurs — `connectors/`
 
-Ils représentent la couche intermédiaire entre l’API et les composants techniques.
+Pas de classes abstraites ni de registre : chaque connecteur est un module de fonctions pures, importées directement par leur appelant.
 
-## Responsabilités
+**Entrée (lecture seule) — `connectors/input/`**
 
-Ils doivent :
+| Connecteur | Fonction | Particularités réelles |
+|---|---|---|
+| CSV | `read_csv(path, delimiter=",")` | Encodage `utf-8-sig`, ligne malformée détectée explicitement, aucune conversion de type (tout reste `str \| None`) |
+| JSON | `read_json(path)` | Accepte une liste d'objets ou un objet unique ; structures profondément imbriquées non prises en charge |
+| REST | `read_rest(config)` | `RestSourceConfig` explicite (URL, méthode, headers, params, timeout, `data_path` pour extraire une réponse enveloppée) ; `RestAuthConfig` supporte `none`/`bearer`/`api_key`/`basic` ; lecture uniquement, via `httpx` |
 
-* charger un projet ;
-* vérifier la configuration ;
-* lancer les opérations ;
-* coordonner les composants ;
-* appliquer les règles applicatives ;
-* gérer les statuts ;
-* préparer les réponses ;
-* gérer les transactions applicatives.
+Les trois convergent vers `connectors/input/normalize.py::normalize_records` (nettoyage des clés, chaînes vides → `None`).
 
-Les principaux services sont :
+**Sortie (export fichier) — `connectors/output/`**
 
-* Project Service ;
-* Document Service ;
-* Schema Service ;
-* Execution Service ;
-* Export Service ;
-* Insert Service ;
-* Report Service.
+`write_csv` (en-têtes = union ordonnée des clés de tous les objets, pour ne perdre aucune colonne optionnelle) et `write_json` (tableau JSON indenté). Toute erreur d'E/S devient un `DataWriterError` avec un code stable.
 
----
+**PostgreSQL (lecture + écriture) — `connectors/postgres/`**
 
-# 6.3 Project Service
+| Fichier | Rôle |
+|---|---|
+| `schema.py` | Modèles Pydantic normalisés : `ColumnSchema`, `ForeignKeySchema`, `UniqueConstraintSchema`, `CheckConstraintSchema`, `TableSchema`, `DatabaseSchema` |
+| `schema_reader.py` | `test_connection`, `read_schema` (introspection via `sqlalchemy.inspect`), `compute_generation_order` (tri topologique sur les clés étrangères ; auto-références ignorées ; dépendance circulaire → `SchemaReaderError(code="circular_dependency")`) |
+| `data_writer.py` | `insert_records` — réflexion de la table cible (`Table(..., autoload_with=engine)`), rejet explicite des colonnes inconnues, insertion **paramétrée** (`sqlalchemy.insert`) dans une unique transaction (`engine.begin()`), `IntegrityError` → rollback automatique + `DataWriteError(code="integrity_error")` |
 
-Le Project Service gère le cycle de vie d’un projet.
+## 5.9 Persistence Layer — `persistence/` + `infrastructure/database.py`
 
-## Responsabilités
+SQLAlchemy **Core** (pas d'ORM) sur PostgreSQL, moteur applicatif interne (`infrastructure/database.py::get_engine`, singleton `@lru_cache`), distinct de toute base cible d'insertion.
 
-Il doit permettre de :
+* `persistence/tables.py` : deux tables, `projects` et `execution_reports`, chacune avec une colonne `JSONB` (`config` / `report`) portant l'objet Pydantic complet, plus quelques colonnes dupliquées pour permettre de filtrer sans parser le JSON (`project_id`, `mode`, `status`, `started_at`...). `create_all(engine)` est idempotent.
+* `persistence/project_repository.py`, `persistence/report_repository.py` : fonctions CRUD directes (`select`/`insert`/`update`/`delete`), pas de couche ORM ni de mapping objet-relationnel.
 
-* créer un projet ;
-* modifier sa configuration ;
-* associer une source ;
-* associer une destination ;
-* associer des documents ;
-* enregistrer les paramètres de génération ;
-* récupérer l’historique ;
-* activer ou désactiver un projet.
+## 5.10 Reporting — `reporting/`
 
-Un projet représente un contexte de génération indépendant.
+* `reporting/report_builder.py::build_execution_report` : fonction pure assemblant un `ExecutionReport` à partir de la requête, du résultat et des horodatages (durée, volumes demandés/générés/valides/rejetés, décompte d'erreurs bloquantes vs avertissements).
+* `reporting/report_service.py` : `save_execution_report` (persistance + log), `get_execution_report`, `list_project_execution_reports`.
 
-Il ne contient aucune logique métier codée.
+## 5.11 Infrastructure — `infrastructure/`
+
+| Fichier | Rôle |
+|---|---|
+| `config.py` | `Settings` (pydantic-settings, `.env`), `get_project_version()` (lit `pyproject.toml`) |
+| `database.py` | Moteur SQLAlchemy interne, singleton |
+| `llm.py` | `get_llm() -> ChatGroq` (langchain-groq), singleton |
+| `embeddings.py` | `get_embeddings() -> OllamaEmbeddings` (langchain-ollama), singleton |
+| `logging.py` | `logging` standard, format structuré, configuration idempotente |
+
+`main.py` lance `uvicorn` avec les host/port de `Settings`.
 
 ---
 
-# 6.4 Document Service
+# 6. Composants du cadrage non implémentés ou implémentés différemment
 
-Le Document Service gère les documents fournis au RAG.
+Pour la maintenabilité, il est important de savoir ce qui **n'existe pas** dans le code malgré sa présence dans le cadrage initial :
 
-## Responsabilités
-
-Il doit :
-
-* enregistrer un document ;
-* valider son format ;
-* stocker ses métadonnées ;
-* déclencher son indexation ;
-* consulter son statut ;
-* supprimer son index ;
-* réindexer une nouvelle version.
+* **Generation Planner** : aucun plan structuré intermédiaire n'est produit. La génération va directement du schéma + contexte RAG à l'appel LLM.
+* **Context Builder** en tant que module dédié : sa responsabilité est assurée, de façon minimale, par `prompts/generation.py`.
+* **Connector Registry** et interfaces abstraites (`BaseConnector`, `DataWriter`, `TransactionalWriter`, ...) : les connecteurs sont des fonctions, sélectionnées par l'appelant (le routeur ou le service) au lieu d'être résolues dynamiquement.
+* **Document Service** et endpoints d'upload/indexation : le pipeline RAG (§5.6) existe et est testé, mais n'est relié à aucune route HTTP.
+* **Schema Service** : `/schema/postgres` (§5.1) n'écrit rien en base et n'est appelé par aucun autre composant ; il n'y a pas de rapprochement automatique entre un schéma analysé et une `GenerationRequest`.
+* **Chaînage Project → Execution** : `ProjectConfig.entities`/`rules` ne sont pas encore lus par `execution_service.py`.
+* **Clarification interactive** (`WAITING_FOR_INPUT`) : n'existe pas — une information manquante ne suspend pas l'exécution, elle produit au mieux un `GenerationError` non bloquant (RAG vide) ou fait échouer la génération (LLM).
+* **Statuts `PENDING` / `RUNNING`** : sans intérêt dans un modèle synchrone requête/réponse ; seuls `READY`, `VALIDATION_FAILED`, `EXPORTED`, `INSERTED`, `FAILED` sont atteignables (`domain/execution.py::ExecutionStatus`).
 
 ---
 
-# 6.5 Schema Service
+# 7. Architecture RAG réelle
 
-Le Schema Service gère l’analyse et la conservation du schéma normalisé.
+## 7.1 Workflow d'indexation
 
-## Responsabilités
-
-Il doit :
-
-* sélectionner le connecteur adapté ;
-* demander l’inspection du schéma ;
-* appeler le Schema Analyzer ;
-* enregistrer le schéma normalisé ;
-* comparer une nouvelle version du schéma ;
-* détecter les changements ;
-* mettre le schéma à disposition du workflow.
-
----
-
-# 6.6 Execution Service
-
-L’Execution Service gère le cycle de vie d’une génération.
-
-## Responsabilités
-
-Il doit :
-
-* créer une exécution ;
-* attribuer un identifiant unique ;
-* enregistrer le mode demandé ;
-* lancer le workflow ;
-* suivre le statut ;
-* enregistrer les étapes ;
-* stocker les erreurs ;
-* stocker les avertissements ;
-* conserver les résultats ;
-* clôturer l’exécution.
-
-## Statuts conceptuels
-
-Les statuts suivants sont envisagés :
-
-```text
-PENDING
-RUNNING
-WAITING_FOR_INPUT
-VALIDATION_FAILED
-READY
-EXPORTED
-INSERTED
-FAILED
+```mermaid
+flowchart LR
+    Doc[Document Markdown\n+ front matter YAML] --> Ingest[rag/ingestion.py\nparse front matter]
+    Ingest --> Clean[rag/cleaning.py\nclean_text]
+    Clean --> Chunk[rag/chunking.py\nsplit par ## puis par taille]
+    Chunk --> Meta[ChunkMetadata\nproject_id, document_id, entity, section...]
+    Meta --> Embed[Ollama Embeddings\nbge-m3]
+    Embed --> Chroma[(ChromaDB)]
 ```
 
-Les valeurs définitives seront validées lors de la conception des modèles.
+`index_corpus(corpus_dir, project_id)` ingère tous les `*.md` d'un répertoire et retourne le nombre de chunks indexés. Les identifiants de chunk (`project_id:document_id:chunk_index`) sont déterministes : réindexer un corpus inchangé écrase les mêmes entrées au lieu de les dupliquer.
 
----
+## 7.2 Workflow de recherche
 
-# 6.7 LangGraph Orchestrator
-
-LangGraph est utilisé pour orchestrer le workflow agentique.
-
-Il représente les différentes étapes sous forme de graphe contrôlé.
-
-## Responsabilités
-
-LangGraph doit :
-
-* maintenir l’état du workflow ;
-* exécuter les étapes dans le bon ordre ;
-* gérer les transitions ;
-* gérer les branches conditionnelles ;
-* appeler uniquement les outils autorisés ;
-* interrompre le workflow ;
-* attendre une clarification ;
-* reprendre une exécution ;
-* arrêter le workflow en cas d’erreur bloquante ;
-* transmettre les résultats entre les nœuds.
-
-## Limites
-
-LangGraph ne réalise pas directement :
-
-* l’analyse technique du schéma ;
-* la recherche vectorielle ;
-* la génération déterministe ;
-* l’écriture dans PostgreSQL ;
-* l’export CSV ou JSON.
-
-LangGraph orchestre les composants responsables de ces actions.
-
----
-
-# 6.8 Schema Analyzer
-
-Le Schema Analyzer transforme les métadonnées brutes fournies par un connecteur en une représentation normalisée.
-
-## Responsabilités
-
-Il doit identifier :
-
-* les entités ;
-* les tables ;
-* les colonnes ;
-* les propriétés ;
-* les types ;
-* les champs obligatoires ;
-* les valeurs par défaut ;
-* les clés primaires ;
-* les clés étrangères ;
-* les relations ;
-* les contraintes ;
-* les dépendances ;
-* les contraintes d’unicité ;
-* l’ordre logique de génération.
-
-## Règle fondamentale
-
-Le Schema Analyzer constitue la source de vérité technique concernant le schéma.
-
-Le LLM et le RAG ne doivent jamais inventer ou remplacer le schéma cible.
-
----
-
-# 6.9 RAG Ingestion Pipeline
-
-Le RAG Ingestion Pipeline prépare les documents métier pour la recherche vectorielle.
-
-## Responsabilités
-
-Il doit :
-
-* charger les documents ;
-* extraire leur contenu ;
-* nettoyer le texte ;
-* découper le contenu ;
-* enrichir les chunks ;
-* générer les embeddings ;
-* indexer les chunks ;
-* stocker les références aux sources ;
-* gérer la version des documents.
-
-## Étapes
-
-```text
-Document
-    |
-    v
-Document Loader
-    |
-    v
-Parser
-    |
-    v
-Chunker
-    |
-    v
-Metadata Enrichment
-    |
-    v
-Embedding Provider
-    |
-    v
-ChromaDB
+```mermaid
+flowchart LR
+    Query[Requête\nentity.name ou context_query] --> Embed[Ollama Embeddings]
+    Embed --> Search[ChromaDB query\nfiltre project_id + entity]
+    Search --> Results[SearchResult\ntext, metadata, distance]
+    Results --> Prompt[prompts/generation.py]
 ```
 
----
+`search(query, project_id, k=5, entity=None)` filtre systématiquement par `project_id` (isolation stricte entre projets) et, si fourni, par `entity`. Retourne une liste vide (jamais une exception propagée) si ChromaDB ou Ollama est indisponible — l'appelant (`_retrieve_context`) transforme cette situation en `GenerationError(code="rag_unavailable", blocking=False)`.
 
-# 6.10 Document Loader
+## 7.3 Règle fondamentale
 
-Le Document Loader charge le contenu des documents supportés.
-
-## Responsabilités
-
-Il doit :
-
-* vérifier le format ;
-* lire le contenu ;
-* extraire le texte ;
-* détecter les erreurs ;
-* préserver les informations de source ;
-* produire une représentation homogène.
-
-Les formats exacts seront définis au moment de l’implémentation du RAG.
-
----
-
-# 6.11 Document Chunker
-
-Le Document Chunker découpe les documents en unités adaptées à la recherche vectorielle.
-
-## Responsabilités
-
-Il doit :
-
-* respecter les sections ;
-* limiter la taille des chunks ;
-* conserver le contexte ;
-* éviter les découpages incohérents ;
-* ajouter les métadonnées ;
-* conserver la référence du document.
-
-Le découpage doit privilégier la structure du document plutôt qu’un découpage arbitraire.
-
----
-
-# 6.12 Embedding Provider
-
-L’Embedding Provider fournit une interface générique pour la génération des embeddings.
-
-## Responsabilités
-
-Il doit :
-
-* générer les embeddings des documents ;
-* générer les embeddings des requêtes ;
-* gérer les erreurs ;
-* gérer les délais ;
-* exposer les informations du modèle ;
-* garantir la compatibilité entre indexation et recherche.
-
-Le modèle utilisé pour rechercher dans une collection doit être compatible avec celui utilisé lors de son indexation.
-
----
-
-# 6.13 ChromaDB
-
-ChromaDB est utilisé comme base vectorielle du POC.
-
-## Responsabilités
-
-ChromaDB doit permettre de :
-
-* stocker les chunks ;
-* stocker les embeddings ;
-* stocker les métadonnées ;
-* isoler les données par projet ;
-* rechercher les passages similaires ;
-* supprimer une collection ;
-* réindexer un corpus.
-
-## Données stockées
-
-ChromaDB contient :
-
-* les textes découpés ;
-* les vecteurs ;
-* les références documentaires ;
-* les métadonnées utiles à la recherche.
-
-## Données non stockées
-
-ChromaDB ne doit pas être utilisé pour stocker :
-
-* les projets ;
-* les connexions ;
-* les secrets ;
-* les datasets générés ;
-* les rapports complets ;
-* l’état des exécutions ;
-* le schéma cible comme source de vérité ;
-* les données à insérer.
-
-Ces informations doivent être stockées dans PostgreSQL ou dans le stockage applicatif prévu.
-
----
-
-# 6.14 RAG Retriever
-
-Le RAG Retriever recherche les passages pertinents dans ChromaDB.
-
-## Responsabilités
-
-Il doit :
-
-* construire la requête de recherche ;
-* interroger ChromaDB ;
-* filtrer les résultats ;
-* limiter le nombre de passages ;
-* classer les résultats ;
-* éliminer les doublons ;
-* retourner les contenus ;
-* retourner les métadonnées ;
-* retourner les références documentaires.
-
-## Filtres possibles
-
-La recherche pourra être filtrée par :
-
-* projet ;
-* document ;
-* version ;
-* type de contenu ;
-* entité ;
-* section ;
-* domaine ;
-* statut du document.
-
-## Règle fondamentale
-
-Le RAG fournit uniquement le contexte métier.
-
-Il ne doit pas remplacer l’analyse du schéma.
-
-Lorsque la documentation contredit le schéma, le conflit doit être signalé.
-
-Il ne doit pas être résolu silencieusement par le LLM.
-
----
-
-# 6.15 Context Builder
-
-Le Context Builder prépare le contexte transmis au LLM.
-
-## Responsabilités
-
-Il doit combiner :
-
-* la demande utilisateur ;
-* le schéma normalisé ;
-* les paramètres ;
-* les règles récupérées ;
-* les passages documentaires ;
-* les données existantes autorisées ;
-* les contraintes du système.
-
-Il doit également :
-
-* limiter la taille du contexte ;
-* supprimer les doublons ;
-* préserver les références ;
-* séparer les informations techniques des informations métier ;
-* éviter l’envoi de données sensibles.
-
----
-
-# 6.16 LLM Provider
-
-Le LLM Provider encapsule l’accès au modèle de langage.
-
-## Responsabilités
-
-Il doit :
-
-* envoyer les prompts ;
-* demander une réponse structurée ;
-* valider le format retourné ;
-* gérer les erreurs ;
-* gérer les délais d’attente ;
-* gérer les nouvelles tentatives ;
-* collecter les métadonnées ;
-* isoler le reste de l’application du fournisseur.
-
-## Interface conceptuelle
-
-```python
-class LLMProvider:
-    def generate_structured(self, request, output_schema):
-        ...
-```
-
-Cette interface est conceptuelle.
-
-La signature définitive sera définie lors de l’implémentation.
-
-## Rôle du LLM
-
-Le LLM peut :
-
-* interpréter une demande ;
-* identifier des règles pertinentes ;
-* construire un plan ;
-* détecter des ambiguïtés ;
-* proposer une stratégie ;
-* produire certains contenus synthétiques ;
-* expliquer des erreurs ;
-* proposer une correction.
-
-## Limites du LLM
-
-Le LLM ne doit pas :
-
-* inventer le schéma ;
-* accéder directement à une base ;
-* exécuter du SQL ;
-* appeler librement une API distante ;
-* écrire dans une destination ;
-* contourner une validation ;
-* décider seul d’une insertion ;
-* modifier les secrets ;
-* modifier une configuration technique.
-
----
-
-# 6.17 Generation Planner
-
-Le Generation Planner construit le plan de génération.
-
-## Entrées
-
-Il reçoit :
-
-* le schéma normalisé ;
-* les paramètres utilisateur ;
-* les règles métier ;
-* le contexte RAG ;
-* les données existantes autorisées ;
-* le mode d’exécution.
-
-## Responsabilités
-
-Il doit définir :
-
-* les entités concernées ;
-* l’ordre de génération ;
-* les dépendances ;
-* les volumes ;
-* les champs à produire ;
-* les valeurs de référence ;
-* les stratégies de génération ;
-* les règles à appliquer ;
-* les validations nécessaires ;
-* les informations manquantes ;
-* les éventuelles demandes de clarification.
-
-## Sortie
-
-Le plan doit être produit sous forme structurée et validé avec Pydantic.
-
----
-
-# 6.18 Generation Engine
-
-Le Generation Engine exécute le plan.
-
-## Responsabilités
-
-Il doit :
-
-* générer les données entité par entité ;
-* respecter l’ordre du plan ;
-* maintenir les relations ;
-* gérer les identifiants ;
-* réutiliser les données existantes autorisées ;
-* appliquer les stratégies définies ;
-* produire des résultats structurés ;
-* conserver la trace de la méthode utilisée ;
-* transmettre les données au Validation Engine.
-
-## Stratégies possibles
-
-Le moteur peut combiner :
-
-* génération déterministe ;
-* génération aléatoire contrôlée ;
-* bibliothèques de données synthétiques ;
-* règles configurées ;
-* valeurs de référence ;
-* génération assistée par LLM.
-
-Le LLM ne doit pas obligatoirement générer chaque valeur.
-
-Pour les gros volumes, les méthodes déterministes doivent être privilégiées.
-
----
-
-# 6.19 Validation Engine
-
-Le Validation Engine contrôle les données produites.
-
-## Responsabilités
-
-Il doit :
-
-* exécuter les validations ;
-* agréger les résultats ;
-* distinguer erreurs et avertissements ;
-* identifier les lignes concernées ;
-* identifier les champs concernés ;
-* indiquer la règle violée ;
-* déterminer si l’erreur est bloquante ;
-* produire un rapport structuré.
-
-## Niveaux de validation
-
-### Validation du contrat
-
-Vérifie :
-
-* la structure ;
-* les types ;
-* les champs obligatoires ;
-* les énumérations.
-
-### Validation du schéma
-
-Vérifie :
-
-* la présence des colonnes ;
-* les types compatibles ;
-* les valeurs nulles ;
-* les contraintes ;
-* les longueurs ;
-* les formats.
-
-### Validation relationnelle
-
-Vérifie :
-
-* les clés primaires ;
-* les clés étrangères ;
-* les dépendances ;
-* les références ;
-* la cohérence entre entités.
-
-### Validation d’unicité
-
-Vérifie :
-
-* les identifiants ;
-* les contraintes uniques ;
-* les doublons internes ;
-* les conflits avec les données existantes.
-
-### Validation métier
-
-Vérifie les règles métier transformées en règles exécutables.
-
-### Validation de destination
-
-Vérifie :
-
-* la compatibilité avec la cible ;
-* la disponibilité de la connexion ;
-* l’ordre d’insertion ;
-* les conflits éventuels.
-
----
-
-# 6.20 Rule Engine
-
-Le Rule Engine exécute les règles de validation métier pouvant être exprimées sous forme déterministe.
-
-## Responsabilités
-
-Il doit :
-
-* charger les règles structurées ;
-* vérifier leur format ;
-* les appliquer aux données ;
-* produire les violations ;
-* indiquer la source documentaire ;
-* distinguer les règles bloquantes des avertissements.
-
-Le Rule Engine doit rester indépendant d’un domaine spécifique.
-
-Les règles doivent être configurées et non codées directement dans le cœur.
-
----
-
-# 6.21 Connector Registry
-
-Le Connector Registry centralise les connecteurs disponibles.
-
-## Responsabilités
-
-Il doit :
-
-* enregistrer les connecteurs ;
-* sélectionner le connecteur adapté ;
-* vérifier ses capacités ;
-* vérifier sa configuration ;
-* empêcher l’accès direct à une implémentation non enregistrée ;
-* retourner une interface commune.
-
-## Capacités conceptuelles
-
-```text
-TEST_CONNECTION
-READ_SCHEMA
-READ_DATA
-WRITE_DATA
-EXPORT_DATA
-TRANSACTION_SUPPORT
-```
-
-Un connecteur n’est pas obligé de supporter toutes les capacités.
-
----
-
-# 6.22 Interfaces des connecteurs
-
-Les connecteurs doivent implémenter des interfaces communes.
-
-```text
-BaseConnector
-├── test_connection()
-└── get_capabilities()
-
-SchemaReader
-└── inspect_schema()
-
-DataReader
-└── read_data()
-
-DataWriter
-└── write_data()
-
-TransactionalWriter
-├── begin()
-├── commit()
-└── rollback()
-
-Exporter
-└── export_data()
-```
-
-Ces interfaces sont conceptuelles.
-
-Les signatures définitives seront définies lors de l’implémentation.
-
----
-
-# 6.23 CSV Connector
-
-Le CSV Connector gère les fichiers CSV.
-
-## Responsabilités
-
-Il doit :
-
-* vérifier l’existence du fichier ;
-* vérifier son encodage ;
-* détecter le séparateur lorsque cela est possible ;
-* lire les colonnes ;
-* lire les données ;
-* proposer une représentation du schéma ;
-* exporter les données en CSV.
-
-## Limites
-
-Le connecteur ne doit pas :
-
-* inventer le sens métier des colonnes ;
-* inventer les types lorsqu’ils ne peuvent pas être déterminés ;
-* supposer un séparateur sans validation ;
-* appliquer des règles métier.
-
----
-
-# 6.24 JSON Connector
-
-Le JSON Connector gère les fichiers JSON.
-
-## Responsabilités
-
-Il doit :
-
-* vérifier la syntaxe ;
-* lire la structure ;
-* analyser les propriétés ;
-* lire les données ;
-* exporter les données en JSON ;
-* retourner les erreurs de structure.
-
-## Limites
-
-Le support des structures profondément imbriquées restera limité dans le POC.
-
-Le connecteur ne doit pas inventer une structure absente.
-
----
-
-# 6.25 REST Connector
-
-Le REST Connector permet de lire des données à partir d’une API distante configurée.
-
-## Responsabilités
-
-Il doit :
-
-* tester l’URL ;
-* exécuter les requêtes configurées ;
-* gérer les en-têtes ;
-* gérer l’authentification configurée ;
-* gérer les paramètres ;
-* gérer la pagination lorsque celle-ci est définie ;
-* lire les réponses ;
-* retourner les erreurs HTTP ;
-* fournir les métadonnées disponibles.
-
-## Limites
-
-Le connecteur ne doit supposer :
-
-* aucun endpoint ;
-* aucun format de réponse ;
-* aucune authentification ;
-* aucune pagination ;
-* aucun contrat distant.
-
-Toutes ces informations doivent être fournies par configuration.
-
-L’écriture vers une API REST n’est pas prioritaire dans le POC initial.
-
----
-
-# 6.26 PostgreSQL Connector
-
-Le PostgreSQL Connector permet d’analyser et d’écrire dans une base PostgreSQL.
-
-## Responsabilités
-
-Il doit :
-
-* tester la connexion ;
-* inspecter le schéma ;
-* lire les métadonnées ;
-* lire les données autorisées ;
-* gérer les requêtes paramétrées ;
-* préparer les insertions ;
-* démarrer une transaction ;
-* insérer les données ;
-* effectuer un commit ;
-* effectuer un rollback ;
-* produire un rapport.
-
-## Règles de sécurité
-
-Le connecteur ne doit jamais :
-
-* exécuter du SQL librement généré par le LLM ;
-* enregistrer le mot de passe dans les logs ;
-* insérer sans validation ;
-* insérer sans autorisation explicite ;
-* ignorer une erreur transactionnelle.
-
----
-
-# 6.27 Export Service
-
-L’Export Service produit les fichiers de sortie.
-
-## Responsabilités
-
-Il doit :
-
-* vérifier le statut de validation ;
-* vérifier l’absence d’erreur bloquante ;
-* sélectionner le format ;
-* appeler le connecteur d’export ;
-* sérialiser les données ;
-* enregistrer les métadonnées ;
-* retourner la référence du fichier ;
-* mettre à jour le rapport.
-
-## Formats du POC
-
-Les formats prévus sont :
-
-* CSV ;
-* JSON.
-
----
-
-# 6.28 Insert Service
-
-L’Insert Service gère l’insertion dans une destination.
-
-## Responsabilités
-
-Il doit :
-
-* vérifier la demande explicite ;
-* vérifier le statut de l’exécution ;
-* vérifier le rapport de validation ;
-* sélectionner le connecteur ;
-* vérifier la capacité d’écriture ;
-* ordonner les entités ;
-* démarrer la transaction ;
-* transmettre les données ;
-* récupérer les résultats ;
-* effectuer le commit ou le rollback ;
-* produire le rapport d’insertion.
-
-## Règle fondamentale
-
-Le LLM ne doit jamais appeler directement le connecteur d’écriture.
-
-L’insertion passe toujours par l’Insert Service.
-
----
-
-# 6.29 Execution Reporter
-
-L’Execution Reporter centralise les informations de chaque étape.
-
-## Responsabilités
-
-Il doit enregistrer :
-
-* l’identifiant d’exécution ;
-* le projet ;
-* le mode ;
-* les paramètres ;
-* le schéma utilisé ;
-* les documents utilisés ;
-* les règles récupérées ;
-* le plan ;
-* les volumes ;
-* les durées ;
-* les erreurs ;
-* les avertissements ;
-* les résultats de validation ;
-* les fichiers exportés ;
-* le résultat de l’insertion ;
-* le statut final.
-
----
-
-# 6.30 Persistence Layer
-
-La Persistence Layer stocke les données internes de SmartData Generator.
-
-La technologie relationnelle retenue est PostgreSQL.
-
-## Données internes
-
-Le stockage interne pourra contenir :
-
-* les projets ;
-* les configurations ;
-* les références de connexion ;
-* les documents ;
-* les versions documentaires ;
-* les indexations ;
-* les schémas normalisés ;
-* les exécutions ;
-* les étapes ;
-* les rapports ;
-* les erreurs ;
-* les métadonnées d’export.
-
-## Séparation des bases
-
-La base interne de SmartData Generator doit être distincte des bases cibles.
-
-Une base cible est analysée ou alimentée par un connecteur.
-
-Elle ne doit pas être confondue avec le stockage interne du service.
-
----
-
-# 7. Architecture RAG
-
-L’architecture RAG comporte deux workflows distincts :
-
-* l’indexation ;
-* la recherche.
-
----
-
-# 7.1 Workflow d’indexation
-
-```text
-Documents métier
-    |
-    v
-Document Service
-    |
-    v
-Document Loader
-    |
-    v
-Parser
-    |
-    v
-Chunker
-    |
-    v
-Metadata Enrichment
-    |
-    v
-Embedding Provider
-    |
-    v
-ChromaDB
-```
-
-## Étapes
-
-1. un document est associé à un projet ;
-2. son format est validé ;
-3. son texte est extrait ;
-4. son contenu est découpé ;
-5. les métadonnées sont ajoutées ;
-6. les embeddings sont générés ;
-7. les chunks sont enregistrés dans ChromaDB ;
-8. le statut d’indexation est enregistré.
-
----
-
-# 7.2 Workflow de recherche
-
-```text
-Contexte de génération
-    |
-    v
-Retrieval Query Builder
-    |
-    v
-Embedding Provider
-    |
-    v
-ChromaDB Search
-    |
-    v
-Metadata Filtering
-    |
-    v
-Result Ranking
-    |
-    v
-Context Builder
-    |
-    v
-Generation Planner
-```
-
-## Étapes
-
-1. le workflow identifie le besoin documentaire ;
-2. une requête de recherche est construite ;
-3. la requête est vectorisée ;
-4. ChromaDB retourne les passages similaires ;
-5. les résultats sont filtrés ;
-6. les doublons sont supprimés ;
-7. les passages sont classés ;
-8. le contexte final est construit ;
-9. les sources sont conservées dans le rapport.
-
----
-
-# 7.3 Métadonnées documentaires
-
-Les chunks devront pouvoir être associés à des métadonnées telles que :
-
-* identifiant du projet ;
-* identifiant du document ;
-* version ;
-* nom du document ;
-* section ;
-* type de contenu ;
-* entité concernée ;
-* date d’indexation ;
-* langue ;
-* statut.
-
-La structure définitive sera conçue pendant l’implémentation du RAG.
-
----
-
-# 7.4 Règles du RAG
-
-Le RAG doit respecter les règles suivantes :
-
-* il contient uniquement la documentation utile ;
-* il fournit des passages sourcés ;
-* il ne remplace pas le schéma ;
-* il ne doit pas injecter tous les documents dans le prompt ;
-* il doit filtrer par projet ;
-* il doit limiter le nombre de résultats ;
-* il doit conserver les références ;
-* il doit signaler l’absence de règle pertinente ;
-* il doit signaler les contradictions détectées.
+Le RAG fournit du texte métier brut au prompt ; il ne produit ni schéma ni règle exécutable. Une règle réellement critique doit être exprimée comme `BusinessRule` (déterministe, §5.7), pas seulement comme passage documentaire.
 
 ---
 
 # 8. Intégration du LLM
 
-# 8.1 Cas d’utilisation du LLM
-
-Le LLM intervient pour :
-
-* comprendre la demande ;
-* identifier les informations nécessaires ;
-* interpréter les règles métier ;
-* construire un plan ;
-* proposer des stratégies ;
-* détecter les ambiguïtés ;
-* produire certains contenus ;
-* expliquer les erreurs ;
-* proposer des corrections.
+* **Fournisseur** : Groq (`langchain-groq`), modèle `llama-3.3-70b-versatile` par défaut (configurable via `LLM_MODEL`).
+* **Accès** : exclusivement via `infrastructure/llm.py::get_llm()`, un singleton `ChatGroq`. Aucun autre module n'importe `langchain_groq` directement.
+* **Sortie structurée** : `get_llm().with_structured_output(batch_model)`, où `batch_model` est un modèle Pydantic généré dynamiquement (`{Entity}Batch`, contenant `items: list[{Entity}]`) à partir du schéma fourni dans la requête. C'est le mécanisme qui garantit que la sortie du LLM respecte le schéma cible sans post-traitement fragile.
+* **Erreurs** : toute exception levée par le fournisseur est interceptée (`except Exception` explicitement commenté comme frontière fournisseur) et convertie en `GenerationError(code="llm_generation_failed", blocking=True)` — jamais propagée telle quelle jusqu'à l'API.
+* **Remplacement de fournisseur** : changer de fournisseur LLM revient à ne modifier que `infrastructure/llm.py` (et la configuration) ; aucun autre module ne connaît Groq.
 
 ---
 
-# 8.2 Abstraction du fournisseur
+# 9. Le graphe LangGraph de génération (réel)
 
-Le fournisseur LLM doit être encapsulé derrière une interface.
-
-Cette interface permet de changer de fournisseur sans modifier :
-
-* le workflow ;
-* les services applicatifs ;
-* le moteur de validation ;
-* les connecteurs ;
-* l’API.
-
-La sélection du fournisseur doit être réalisée par configuration.
-
----
-
-# 8.3 Prompts
-
-Les prompts doivent être construits par des composants dédiés.
-
-Ils doivent distinguer :
-
-* les instructions système ;
-* le schéma technique ;
-* les règles métier ;
-* la documentation récupérée ;
-* la demande utilisateur ;
-* le format attendu ;
-* les garde-fous.
-
-Les prompts ne doivent pas inclure inutilement des données sensibles.
-
----
-
-# 8.4 Réponses structurées
-
-Les étapes critiques doivent utiliser des schémas de sortie.
-
-Exemples :
-
-* `GenerationPlan` ;
-* `ClarificationRequest` ;
-* `GenerationStrategy` ;
-* `GeneratedDataset` ;
-* `ValidationExplanation` ;
-* `ExecutionSummary`.
-
-Les noms définitifs seront définis pendant l’implémentation.
-
----
-
-# 8.5 Gestion des erreurs LLM
-
-Le LLM Provider doit gérer :
-
-* les erreurs d’authentification ;
-* les délais dépassés ;
-* les limites de taux ;
-* les réponses invalides ;
-* les sorties non conformes ;
-* les erreurs de parsing ;
-* les indisponibilités ;
-* les nouvelles tentatives.
-
-Une erreur LLM ne doit jamais déclencher une insertion partielle.
-
----
-
-# 9. Rôle de LangGraph
-
-LangGraph structure le processus de génération.
-
-Le workflow doit être contrôlé et non entièrement autonome.
-
----
-
-# 9.1 État du workflow
-
-L’état du graphe pourra contenir :
-
-* l’identifiant du projet ;
-* l’identifiant d’exécution ;
-* le mode ;
-* la demande ;
-* le schéma ;
-* le contexte RAG ;
-* le plan ;
-* les clarifications ;
-* les données générées ;
-* les résultats de validation ;
-* les erreurs ;
-* les avertissements ;
-* le rapport.
-
-La structure définitive sera conçue lors de l’implémentation.
-
----
-
-# 9.2 Nœuds conceptuels
-
-Les principaux nœuds sont :
-
-* `load_project` ;
-* `validate_configuration` ;
-* `analyze_schema` ;
-* `retrieve_business_context` ;
-* `build_generation_plan` ;
-* `request_clarification` ;
-* `generate_data` ;
-* `validate_data` ;
-* `prepare_preview` ;
-* `export_data` ;
-* `verify_insert_authorization` ;
-* `insert_data` ;
-* `build_report`.
-
----
-
-# 9.3 Graphe conceptuel
-
-```text
-START
-  |
-  v
-load_project
-  |
-  v
-validate_configuration
-  |
-  v
-analyze_schema
-  |
-  v
-retrieve_business_context
-  |
-  v
-build_generation_plan
-  |
-  +------ missing_information ------> request_clarification
-  |                                       |
-  |                                       v
-  |                                  WAIT_FOR_INPUT
-  |
-  v
-generate_data
-  |
-  v
-validate_data
-  |
-  +------ validation_failed --------> correction_or_stop
-  |
-  v
-prepare_preview
-  |
-  +------ preview_mode -------------> END
-  |
-  +------ export_requested ---------> export_data
-  |                                       |
-  |                                       v
-  |                                      END
-  |
-  +------ insert_requested ---------> verify_insert_authorization
-                                           |
-                                           v
-                                      insert_data
-                                           |
-                                           v
-                                      build_report
-                                           |
-                                           v
-                                          END
+```mermaid
+flowchart TD
+    Start([START]) --> Retrieve[retrieve_context]
+    Retrieve --> Generate[generate_data]
+    Generate -->|status == FAILED| HandleError[handle_error]
+    Generate -->|sinon| Validate[validate_data]
+    Validate -->|status == FAILED| HandleError
+    Validate -->|sinon| Finalize[finalize]
+    Finalize --> End([END])
+    HandleError --> End
 ```
 
----
-
-# 9.4 Interruptions et reprises
-
-LangGraph doit permettre d’interrompre le workflow lorsque :
-
-* une information manque ;
-* une clarification est nécessaire ;
-* une validation humaine est requise ;
-* une erreur bloquante est détectée ;
-* une autorisation d’insertion est attendue.
-
-Le workflow doit pouvoir reprendre à partir de l’état enregistré.
+Ce graphe (`agents/generation_agent.py::get_generation_graph`) est **le seul** LangGraph du service. Il ne couvre ni l'analyse de schéma, ni l'Export, ni l'Insert : ces étapes sont des appels de fonction directs dans `execution_service.py`, en dehors de tout graphe. La compilation du graphe est mise en cache (`@lru_cache`) — un seul objet compilé est réutilisé pour toutes les exécutions du processus.
 
 ---
 
 # 10. Architecture des connecteurs
 
-Les connecteurs sont indépendants du moteur IA.
+## 10.1 Matrice des capacités (réelle)
 
-Ils servent uniquement à :
+| Connecteur | Analyse de schéma | Lecture | Écriture | Export | Transaction |
+| ---------- | -----------------: | ------: | -------: | -----: | -----------: |
+| CSV        | Non (types non déduits) | Oui | Non | Oui | Non |
+| JSON       | Non (types non déduits) | Oui | Non | Oui | Non |
+| REST       | Non | Oui (GET/POST configurés) | Non | Non | Non |
+| PostgreSQL | Oui (introspection complète) | Non implémenté* | Oui | Non | Oui |
 
-* tester une connexion ;
-* lire un schéma ;
-* lire des données ;
-* écrire des données ;
-* exporter des données.
+\* La lecture de données existantes en PostgreSQL (pour éviter des conflits d'unicité, cf. `user_cases.md` PREVIEW-04) n'est pas implémentée ; seules l'introspection de schéma (`read_schema`) et l'insertion (`insert_records`) le sont.
 
----
+## 10.2 Indépendance des connecteurs
 
-# 10.1 Matrice des capacités
-
-| Connecteur |   Analyse de schéma | Lecture |               Écriture | Export | Transaction |
-| ---------- | ------------------: | ------: | ---------------------: | -----: | ----------: |
-| CSV        |                 Oui |     Oui |                    Non |    Oui |         Non |
-| JSON       |                 Oui |     Oui |                    Non |    Oui |         Non |
-| REST       | Selon configuration |     Oui | Hors périmètre initial |    Non |         Non |
-| PostgreSQL |                 Oui |     Oui |                    Oui |    Non |         Oui |
+Vérifié dans le code : aucun module de `connectors/` n'importe `agents/`, `rag/`, ni `infrastructure/llm.py`. Les connecteurs ne connaissent que leurs propres modèles de configuration (Pydantic) et des types `dict`/`list[dict]` génériques en entrée/sortie.
 
 ---
 
-# 10.2 Indépendance des connecteurs
+# 11. Mécanismes de validation (réels)
 
-Un connecteur ne doit contenir :
+## 11.1 Validation des requêtes API
 
-* aucun prompt ;
-* aucun appel LLM ;
-* aucune recherche RAG ;
-* aucune règle métier ;
-* aucune orchestration agentique ;
-* aucune logique propre à Pricing Control Tower.
+FastAPI + Pydantic v2 valident automatiquement `ExecutionRequest`, `GenerationRequest`, `PostgresSchemaRequest` (types, champs obligatoires, `Literal` pour les modes/formats). Une requête invalide reçoit un `422` avant même d'atteindre `application/`.
 
----
+## 11.2 Validation du schéma cible
 
-# 11. Mécanismes de validation
+`domain/schema.py::build_entity_model` construit un modèle Pydantic dynamique à partir d'`EntitySpec` : c'est ce modèle qui sert à la fois de contrat de sortie pour le LLM et de première passe de validation dans `validate_batch`.
 
-La validation est organisée en plusieurs couches.
+## 11.3 Validation des sorties LLM
 
----
+Garantie structurellement par `with_structured_output(batch_model)` (§8) : LangChain rejette/retente une sortie qui ne respecte pas le schéma Pydantic attendu avant de la retourner à l'appelant.
 
-# 11.1 Validation des requêtes API
+## 11.4 Validation des données générées
 
-FastAPI et Pydantic valident :
+`validate_batch` (§5.7) : types → règles métier déterministes → agrégation en `ValidationReport`.
 
-* les champs obligatoires ;
-* les formats ;
-* les types ;
-* les valeurs autorisées ;
-* les paramètres de génération ;
-* le mode demandé.
+## 11.5 Validation avant Export
 
----
+`execution_service.py::_dispatch` vérifie `_blocked_by_validation` (statut `FAILED` ou aucun item) **avant** d'atteindre `_execute_export`/`_execute_insert`. Si tout est bloqué, le mode retourne `VALIDATION_FAILED` sans qu'aucun fichier ne soit écrit ni qu'aucune connexion ne soit ouverte.
 
-# 11.2 Validation de configuration
+## 11.6 Validation avant Insert
 
-Avant l’exécution, le système vérifie :
+En plus du contrôle précédent : présence de `insert_target` (`insert_target_missing`), présence de `confirm_insert=True` (`insert_not_confirmed`) — voir §3.3.
 
-* l’existence du projet ;
-* la présence du schéma ;
-* la configuration du connecteur ;
-* la disponibilité du fournisseur LLM ;
-* la disponibilité de ChromaDB ;
-* la présence des documents requis ;
-* la cohérence des paramètres.
+## 11.7 Validation transactionnelle
+
+`connectors/postgres/data_writer.py::insert_records` : une seule transaction SQLAlchemy (`engine.begin()`) couvre l'insertion de tous les objets ; toute `IntegrityError` provoque un rollback automatique (comportement natif de `engine.begin()` en cas d'exception) et aucune ligne partielle n'est conservée.
 
 ---
 
-# 11.3 Validation du schéma
+# 12. Flux de données réels
 
-Le Schema Analyzer vérifie :
+## 12.1 Flux Preview / Export / Insert
 
-* la présence des métadonnées ;
-* la cohérence des types ;
-* la résolution des relations ;
-* les dépendances ;
-* les contraintes ;
-* la capacité à ordonner les entités.
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as FastAPI (/executions)
+    participant ES as execution_service.execute()
+    participant GA as generation_agent.run_generation()
+    participant VE as validation.engine
+    participant OUT as connectors.output / connectors.postgres
+    participant REP as reporting
 
----
+    C->>API: POST /executions (mode, entity, count, ...)
+    API->>ES: execute(request)
+    ES->>GA: run_generation(request.generation)
+    GA->>GA: retrieve_context (RAG)
+    GA->>GA: generate_data (LLM structuré)
+    GA->>VE: validate_batch(entity, items, rules)
+    VE-->>GA: ValidationReport
+    GA-->>ES: GenerationResult
 
-# 11.4 Validation des sorties IA
+    alt aucune donnée valide
+        ES-->>API: status = VALIDATION_FAILED
+    else mode = PREVIEW
+        ES-->>API: status = READY
+    else mode = EXPORT
+        ES->>OUT: write_csv / write_json
+        OUT-->>ES: chemin du fichier
+        ES-->>API: status = EXPORTED
+    else mode = INSERT
+        ES->>ES: vérifie insert_target + confirm_insert
+        ES->>OUT: insert_records (transaction)
+        OUT-->>ES: lignes insérées / rollback
+        ES-->>API: status = INSERTED ou FAILED
+    end
 
-Pydantic vérifie :
-
-* le format du plan ;
-* la présence des champs ;
-* les types ;
-* les énumérations ;
-* la structure des réponses ;
-* les valeurs obligatoires.
-
-Une sortie invalide doit être rejetée ou corrigée avant de poursuivre.
-
----
-
-# 11.5 Validation des données générées
-
-Le Validation Engine vérifie :
-
-* les types ;
-* les champs obligatoires ;
-* les valeurs nulles ;
-* les formats ;
-* les longueurs ;
-* les domaines de valeurs ;
-* les relations ;
-* les clés étrangères ;
-* les contraintes d’unicité ;
-* les règles métier ;
-* la compatibilité avec les données existantes.
-
----
-
-# 11.6 Validation avant Preview
-
-Le Preview peut être généré même si des erreurs existent.
-
-Les erreurs doivent être clairement affichées.
-
-Le Preview ne constitue pas une autorisation d’export ou d’insertion.
-
----
-
-# 11.7 Validation avant Export
-
-Avant l’export, le système vérifie :
-
-* l’absence d’erreur bloquante ;
-* le format demandé ;
-* la sérialisation ;
-* la disponibilité du stockage ;
-* la cohérence du dataset.
-
----
-
-# 11.8 Validation avant Insert
-
-Avant l’insertion, le système vérifie :
-
-* la demande explicite ;
-* l’état de l’exécution ;
-* l’absence d’erreur bloquante ;
-* la disponibilité de la connexion ;
-* la compatibilité du schéma ;
-* l’ordre des dépendances ;
-* les conflits éventuels ;
-* la capacité transactionnelle ;
-* l’autorisation d’écriture.
-
----
-
-# 11.9 Validation transactionnelle
-
-Lors de l’insertion PostgreSQL :
-
-1. une transaction est ouverte ;
-2. les données sont insérées dans l’ordre ;
-3. les erreurs sont collectées ;
-4. une validation finale est réalisée ;
-5. un commit est effectué si tout est valide ;
-6. un rollback est effectué en cas d’échec.
-
----
-
-# 12. Flux de données
-
-# 12.1 Flux d’analyse du schéma
-
-```text
-Client
-  |
-  v
-FastAPI
-  |
-  v
-Schema Service
-  |
-  v
-Connector Registry
-  |
-  v
-Source Connector
-  |
-  v
-Schema Analyzer
-  |
-  v
-Normalized Schema
-  |
-  v
-Internal PostgreSQL
+    ES->>REP: build_execution_report + save_execution_report
+    API-->>C: ExecutionResult (JSON)
 ```
 
-## Étapes
-
-1. le client fournit une configuration ;
-2. l’API valide la requête ;
-3. le connecteur est sélectionné ;
-4. la connexion est testée ;
-5. les métadonnées sont extraites ;
-6. le Schema Analyzer normalise le résultat ;
-7. le schéma est enregistré.
-
----
-
-# 12.2 Flux d’indexation RAG
+## 12.2 Flux d'analyse de schéma (indépendant)
 
 ```text
-Client
-  |
-  v
-FastAPI
-  |
-  v
-Document Service
-  |
-  v
-Document Loader
-  |
-  v
-Chunker
-  |
-  v
-Embedding Provider
-  |
-  v
-ChromaDB
-```
-
-## Étapes
-
-1. le document est chargé ;
-2. le format est validé ;
-3. le texte est extrait ;
-4. les chunks sont créés ;
-5. les métadonnées sont ajoutées ;
-6. les embeddings sont générés ;
-7. les chunks sont indexés ;
-8. le statut est enregistré.
-
----
-
-# 12.3 Flux Preview
-
-```text
-Client
-  |
-  v
-FastAPI
-  |
-  v
-Execution Service
-  |
-  v
-LangGraph Orchestrator
-  |
-  +--> Schema Analyzer
-  |
-  +--> RAG Retriever
-  |
-  +--> Generation Planner
-  |
-  +--> LLM Provider
-  |
-  +--> Generation Engine
-  |
-  +--> Validation Engine
-  |
-  +--> Execution Reporter
-  |
-  v
-Preview Response
-```
-
-## Étapes
-
-1. une exécution est créée ;
-2. la configuration est chargée ;
-3. le schéma est récupéré ;
-4. les règles sont recherchées ;
-5. le contexte est construit ;
-6. le plan est généré ;
-7. une clarification est demandée si nécessaire ;
-8. les données sont générées ;
-9. les données sont validées ;
-10. le Preview est préparé ;
-11. le rapport est enregistré ;
-12. la réponse est retournée.
-
----
-
-# 12.4 Flux Export
-
-```text
-Validated Preview
-  |
-  v
-Export Request
-  |
-  v
-Export Service
-  |
-  v
-CSV Connector or JSON Connector
-  |
-  v
-Export File
-  |
-  v
-Execution Reporter
+Client → POST /schema/postgres → connectors.postgres.schema_reader.read_schema()
+       → sqlalchemy.inspect() → DatabaseSchema (tables, colonnes, FK, ordre de génération)
+       → réponse HTTP directe (rien n'est persisté)
 ```
 
 ---
 
-# 12.5 Flux Insert
-
-```text
-Validated Preview
-  |
-  v
-Explicit Insert Request
-  |
-  v
-Insert Service
-  |
-  v
-PostgreSQL Connector
-  |
-  v
-Begin Transaction
-  |
-  v
-Insert Data
-  |
-  v
-Final Validation
-  |
-  +------ success ------> Commit
-  |
-  +------ failure ------> Rollback
-  |
-  v
-Execution Reporter
-```
-
----
-
-# 13. Diagramme d’architecture globale
+# 13. Diagramme d'architecture globale (réel)
 
 ```mermaid
 flowchart TB
-    Client[API Client]
+    Client[Client API]
 
-    subgraph API["API Layer"]
-        FastAPI[FastAPI REST API]
+    subgraph API["api/ — FastAPI"]
+        Health[GET /health]
+        Executions[POST /executions]
+        SchemaEP[POST /schema/postgres]
     end
 
-    subgraph Application["Application Layer"]
-        ProjectService[Project Service]
-        DocumentService[Document Service]
-        SchemaService[Schema Service]
-        ExecutionService[Execution Service]
-        ExportService[Export Service]
-        InsertService[Insert Service]
-        ReportService[Report Service]
+    subgraph App["application/"]
+        ExecService[execution_service.execute]
+        ProjService[project_service]
     end
 
-    subgraph Orchestration["AI Orchestration"]
-        LangGraph[LangGraph Orchestrator]
-        ContextBuilder[Context Builder]
-        Planner[Generation Planner]
-        Generator[Generation Engine]
-        Validator[Validation Engine]
-        RuleEngine[Rule Engine]
-        Reporter[Execution Reporter]
+    subgraph Agent["agents/ — LangGraph"]
+        GenGraph[generation_agent\nretrieve → generate → validate]
     end
 
-    subgraph AI["AI Providers"]
-        LLM[LLM Provider]
-        Embeddings[Embedding Provider]
+    subgraph Support["Modules techniques"]
+        Prompt[prompts/generation.py]
+        RAG[rag/*]
+        Val[validation/engine.py]
+        LLM[infrastructure/llm.py\nGroq]
+        Emb[infrastructure/embeddings.py\nOllama]
     end
 
-    subgraph RAG["RAG Layer"]
-        Loader[Document Loader]
-        Chunker[Document Chunker]
-        Retriever[RAG Retriever]
+    subgraph Conn["connectors/"]
+        In[input: csv, json, rest]
+        Out[output: csv, json]
+        PG[postgres: schema_reader, data_writer]
+    end
+
+    subgraph Store["Stockage"]
         Chroma[(ChromaDB)]
+        InternalDB[(PostgreSQL interne\nprojects, execution_reports)]
+        TargetDB[(PostgreSQL cible\nfournie par l appelant)]
+        Files[(Fichiers export\nCSV / JSON)]
     end
 
-    subgraph Schema["Schema Layer"]
-        SchemaAnalyzer[Schema Analyzer]
+    subgraph Report["reporting/"]
+        Builder[report_builder]
+        Service[report_service]
     end
 
-    subgraph Connectors["Connector Layer"]
-        Registry[Connector Registry]
-        CSV[CSV Connector]
-        JSON[JSON Connector]
-        REST[REST Connector]
-        PostgreSQLConnector[PostgreSQL Connector]
-    end
+    Client --> Health
+    Client --> Executions
+    Client --> SchemaEP
 
-    subgraph Storage["Internal Storage"]
-        InternalPostgres[(SmartData PostgreSQL)]
-        ExportStorage[(Export Storage)]
-    end
+    Executions --> ExecService
+    ExecService --> GenGraph
+    GenGraph --> RAG
+    RAG --> Emb --> Chroma
+    GenGraph --> Prompt --> LLM
+    GenGraph --> Val
 
-    Client --> FastAPI
+    ExecService --> Out
+    Out --> Files
+    ExecService --> PG
+    PG --> TargetDB
 
-    FastAPI --> ProjectService
-    FastAPI --> DocumentService
-    FastAPI --> SchemaService
-    FastAPI --> ExecutionService
-    FastAPI --> ExportService
-    FastAPI --> InsertService
-    FastAPI --> ReportService
+    ExecService --> Builder --> Service --> InternalDB
 
-    ProjectService --> InternalPostgres
-    DocumentService --> InternalPostgres
-    SchemaService --> InternalPostgres
-    ExecutionService --> InternalPostgres
-    ReportService --> InternalPostgres
+    SchemaEP --> PG
 
-    ExecutionService --> LangGraph
-
-    LangGraph --> ContextBuilder
-    LangGraph --> SchemaAnalyzer
-    LangGraph --> Retriever
-    LangGraph --> Planner
-    LangGraph --> Generator
-    LangGraph --> Validator
-    LangGraph --> Reporter
-
-    ContextBuilder --> Planner
-    Planner --> LLM
-    Generator --> LLM
-    Validator --> RuleEngine
-
-    DocumentService --> Loader
-    Loader --> Chunker
-    Chunker --> Embeddings
-    Embeddings --> Chroma
-
-    Retriever --> Chroma
-    Retriever --> Embeddings
-    Retriever --> ContextBuilder
-
-    SchemaService --> SchemaAnalyzer
-    SchemaAnalyzer --> Registry
-
-    Registry --> CSV
-    Registry --> JSON
-    Registry --> REST
-    Registry --> PostgreSQLConnector
-
-    ExportService --> CSV
-    ExportService --> JSON
-    ExportService --> ExportStorage
-
-    InsertService --> PostgreSQLConnector
-
-    Reporter --> InternalPostgres
+    ProjService --> InternalDB
 ```
 
 ---
 
-# 14. Diagramme du workflow LangGraph
+# 14. Diagramme du graphe de génération
 
-```mermaid
-flowchart TD
-    Start([START])
-    LoadProject[Load Project]
-    ValidateConfig[Validate Configuration]
-    AnalyzeSchema[Analyze Schema]
-    RetrieveContext[Retrieve Business Context]
-    BuildPlan[Build Generation Plan]
-    CheckMissing{Missing Information?}
-    Clarification[Request Clarification]
-    Wait[WAIT FOR INPUT]
-    Generate[Generate Data]
-    Validate[Validate Data]
-    ValidationOk{Validation Successful?}
-    Correction[Correction or Stop]
-    Preview[Prepare Preview]
-    Mode{Execution Mode}
-    Export[Export Data]
-    CheckInsert[Verify Insert Authorization]
-    Insert[Insert Data]
-    Report[Build Execution Report]
-    End([END])
-
-    Start --> LoadProject
-    LoadProject --> ValidateConfig
-    ValidateConfig --> AnalyzeSchema
-    AnalyzeSchema --> RetrieveContext
-    RetrieveContext --> BuildPlan
-    BuildPlan --> CheckMissing
-
-    CheckMissing -- Yes --> Clarification
-    Clarification --> Wait
-
-    CheckMissing -- No --> Generate
-    Generate --> Validate
-    Validate --> ValidationOk
-
-    ValidationOk -- No --> Correction
-    Correction --> Report
-
-    ValidationOk -- Yes --> Preview
-    Preview --> Mode
-
-    Mode -- Preview --> Report
-    Mode -- Export --> Export
-    Export --> Report
-
-    Mode -- Insert --> CheckInsert
-    CheckInsert --> Insert
-    Insert --> Report
-
-    Report --> End
-```
+Voir §9 (le graphe est déjà présenté en détail).
 
 ---
 
 # 15. Sécurité
 
-L’architecture doit respecter les règles suivantes :
+Principes appliqués dans le code actuel :
 
-* aucun secret dans le dépôt ;
-* configuration par variables d’environnement ;
-* masquage des mots de passe ;
-* chiffrement ou protection des informations sensibles ;
-* validation des chemins ;
-* validation des URLs ;
-* validation des paramètres de connexion ;
-* utilisation de requêtes paramétrées ;
-* interdiction du SQL libre généré par LLM ;
-* séparation entre lecture et écriture ;
-* confirmation explicite avant insertion ;
-* journalisation des opérations sensibles ;
-* limitation des données envoyées au LLM ;
-* absence de données personnelles réelles dans les prompts ;
-* contrôle des types de fichiers ;
-* limitation de la taille des documents ;
-* limitation de la taille des requêtes ;
-* délais d’attente sur les appels externes.
+* aucun secret dans le dépôt : `.env` est ignoré par git (`.gitignore`), lu via `pydantic-settings` ;
+* requêtes paramétrées uniquement (`sqlalchemy.insert`, jamais de SQL assemblé par concaténation) ;
+* interdiction structurelle du SQL généré par le LLM : le LLM ne produit que des objets Pydantic (`with_structured_output`), jamais de texte SQL, et n'a accès à aucun connecteur ;
+* confirmation explicite avant toute insertion (§3.3) ;
+* messages d'erreur internes non exposés au client : le handler générique (`api/errors.py::_unexpected_error_handler`) retourne toujours `{"code": "internal_error", "message": "Une erreur interne est survenue."}` sur 500, la trace complète restant uniquement dans les logs serveur (`logger.exception`).
+
+Écarts connus par rapport au cadrage (à traiter avant une mise en production) :
+
+* aucun chiffrement ni masquage des mots de passe de connexion (`database_url` circule et est loggé tel quel dans certains messages d'erreur, ex. `data_writer.py` via le message d'exception SQLAlchemy) ;
+* pas de limitation de taille de requête HTTP, pas de limitation de taille de document RAG ;
+* pas de gestion de secrets externalisée (Vault, AWS Secrets Manager, ...) — un seul `.env` local.
 
 ---
 
-# 16. Gestion des erreurs
+# 16. Gestion des erreurs (catalogue réel)
 
-Les erreurs doivent être structurées.
+Chaque connecteur définit sa propre exception avec un `code` stable et un `message` :
 
-Les catégories minimales sont :
+| Exception | Codes observés dans le code |
+|---|---|
+| `DataReaderError` (`connectors/input/errors.py`) | `file_not_found`, `not_a_file`, `empty_file`, `encoding_error`, `csv_parse_error`, `malformed_row`, `json_parse_error`, `invalid_json_structure`, `invalid_auth_config`, `data_path_not_found`, `timeout`, `http_error`, `connection_error`, `invalid_json_response` |
+| `DataWriterError` (`connectors/output/errors.py`) | `no_data`, `write_error` |
+| `SchemaReaderError` (`connectors/postgres/errors.py`) | `connection_error`, `empty_schema`, `introspection_error`, `circular_dependency` |
+| `DataWriteError` (`connectors/postgres/errors.py`) | `connection_error`, `table_not_found`, `unknown_column`, `integrity_error`, `insert_error`, `no_data` |
+| `GenerationError` (`domain/generation.py`, `code`/`stage`/`blocking`) | `rag_unavailable` (non bloquant), `llm_generation_failed` (bloquant), `incomplete_generation` (non bloquant), `insert_target_missing` (bloquant), `insert_not_confirmed` (bloquant), + tout code de `ValidationIssue` reporté comme erreur de validation |
 
-* erreur de configuration ;
-* erreur de validation d’entrée ;
-* erreur de connexion ;
-* erreur d’analyse du schéma ;
-* erreur d’indexation ;
-* erreur de recherche RAG ;
-* erreur du fournisseur LLM ;
-* erreur d’embeddings ;
-* erreur de génération ;
-* erreur de validation ;
-* erreur d’export ;
-* erreur d’insertion ;
-* erreur de transaction ;
-* erreur interne.
-
-Chaque erreur doit contenir :
-
-* un code ;
-* une catégorie ;
-* un message ;
-* une étape ;
-* une sévérité ;
-* un caractère bloquant ;
-* un identifiant de corrélation ;
-* un identifiant d’exécution.
+`api/errors.py` ne mappe explicitement en HTTP que `SchemaReaderError` (→ 502) ; `DataWriteError`/`DataWriterError` ne sont aujourd'hui interceptées qu'à l'intérieur d'`execution_service.py` et transformées en `GenerationError` dans la réponse `200` (§ jamais d'erreur HTTP pour un échec métier d'Export/Insert — voir la description de la route dans `api/routers/executions.py`).
 
 ---
 
-# 17. Observabilité
+# 17. Observabilité (état réel)
 
-L’architecture doit être compatible avec une future solution de monitoring.
+* Logs structurés via le module `logging` standard (`infrastructure/logging.py`), format `%(asctime)s level=%(levelname)s logger=%(name)s %(message)s`.
+* Chaque exécution est identifiée par un `run_id` (`uuid4().hex`) préfixant systématiquement les lignes de log de `execution_service.py` et `generation_agent.py` (`[%s] ...`).
+* Le rapport d'exécution (`ExecutionReport`) contient durée, volumes, décompte d'erreurs bloquantes/non bloquantes — interrogeable via `reporting/report_service.py`.
 
-Elle doit prévoir :
-
-* des logs structurés ;
-* un identifiant de corrélation ;
-* un identifiant d’exécution ;
-* des métriques ;
-* des durées par étape ;
-* le nombre d’appels LLM ;
-* le nombre d’erreurs LLM ;
-* le nombre de documents indexés ;
-* le nombre de résultats RAG ;
-* le nombre de lignes générées ;
-* le nombre d’erreurs de validation ;
-* le nombre d’exports ;
-* le nombre d’insertions ;
-* le nombre de rollbacks ;
-* le statut des connecteurs.
-
-Les datasets complets ne doivent pas être enregistrés dans les logs.
+Non implémenté : métriques (Prometheus ou équivalent), traçage distribué, tableau de bord. Le seul "monitoring" possible aujourd'hui est la lecture des logs et des rapports en base.
 
 ---
 
-# 18. Testabilité
+# 18. Testabilité (réelle)
 
-Chaque composant doit pouvoir être testé indépendamment.
-
-## Tests unitaires
-
-Ils doivent couvrir :
-
-* le Schema Analyzer ;
-* le Chunker ;
-* le Context Builder ;
-* le Generation Planner ;
-* le Validation Engine ;
-* le Rule Engine ;
-* les connecteurs ;
-* les transitions LangGraph ;
-* les modèles Pydantic.
-
-## Tests d’intégration
-
-Ils doivent couvrir :
-
-* l’API ;
-* PostgreSQL ;
-* ChromaDB ;
-* le pipeline d’indexation ;
-* la recherche RAG ;
-* le workflow Preview ;
-* le workflow Export ;
-* le workflow Insert ;
-* les transactions ;
-* le rollback.
-
-## Doubles de tests
-
-Les fournisseurs externes doivent pouvoir être remplacés par :
-
-* des mocks ;
-* des stubs ;
-* des fake providers ;
-* des connecteurs de test.
+* **Tests unitaires** (`tests/*.py`, hors `tests/integration/`) : substituent les frontières externes par `monkeypatch` (ex. `run_generation`, `save_execution_report`, `insert_records`) — aucun réseau, aucune base réelle. 111 tests à ce jour.
+* **Tests d'intégration** (`tests/integration/*.py`) : s'exécutent contre de vrais services (PostgreSQL, ChromaDB, Ollama, Groq), sautés automatiquement (`pytest.mark.skipif`) via `tests/integration/_reachability.py::is_reachable` si le service n'est pas joignable — pas de conteneurs de test éphémères, les services doivent être démarrés au préalable (`docker compose -f docker/docker-compose.yml up -d`).
+* **CI** (`.github/workflows/ci.yml`) : `ruff check` + `pytest` sur chaque push/PR vers `main`, suivi d'une release sémantique automatique (`python-semantic-release`) basée sur les messages de commit conventionnels.
 
 ---
 
-# 19. Évolutivité
-
-L’architecture doit permettre d’ajouter ultérieurement :
-
-* de nouveaux connecteurs ;
-* de nouveaux formats ;
-* de nouveaux fournisseurs LLM ;
-* de nouveaux fournisseurs d’embeddings ;
-* une autre base vectorielle ;
-* une interface utilisateur ;
-* une gestion avancée des utilisateurs ;
-* un système multi-tenant ;
-* un stockage objet ;
-* une file de messages ;
-* des workers asynchrones ;
-* du monitoring ;
-* une génération distribuée ;
-* des règles de validation supplémentaires.
-
-Ces évolutions ne doivent pas nécessiter une réécriture du cœur.
-
----
-
-# 20. Limites de l’architecture du POC
-
-Le POC ne vise pas :
-
-* la génération de plusieurs millions de lignes ;
-* le traitement distribué ;
-* la prise en charge de toutes les bases ;
-* le support de tous les formats ;
-* le streaming ;
-* le multi-cloud ;
-* le multi-tenant ;
-* une interface graphique complète ;
-* l’entraînement d’un modèle ;
-* le fine-tuning ;
-* l’écriture générique vers n’importe quelle API ;
-* l’exécution de code produit dynamiquement par le LLM.
-
----
-
-# 21. Organisation logique cible
+# 19. Organisation réelle du code
 
 ```text
-app/
+.
+├── agents/                  # Le seul graphe LangGraph (génération)
 ├── api/
-├── application/
-├── core/
-├── domain/
-├── orchestration/
-├── generation/
-├── validation/
-├── rag/
-├── llm/
-├── embeddings/
+│   ├── routers/              # health, executions, schema_analysis
+│   └── schemas/               # Contrats HTTP (distincts de domain/)
+├── application/              # execution_service, project_service
 ├── connectors/
-├── persistence/
-├── reporting/
-└── main.py
+│   ├── input/                 # csv, json, rest (lecture seule)
+│   ├── output/                 # csv, json (export)
+│   └── postgres/                # schema_reader (lecture) + data_writer (écriture)
+├── domain/                   # Modèles Pydantic purs
+├── infrastructure/           # config, database, llm, embeddings, logging
+├── persistence/              # SQLAlchemy Core : projects, execution_reports
+├── prompts/                  # Construction des prompts LLM
+├── rag/                      # ingestion, chunking, cleaning, vectorstore, indexing
+├── reporting/                # report_builder, report_service
+├── validation/               # engine (règles déterministes), schemas
+├── docker/                   # docker-compose (PostgreSQL applicatif + ChromaDB)
+├── docs/                     # 01_framing, 02_architecture, 03_validation
+├── tests/                    # unitaires
+│   └── integration/            # contre services réels, skip si indisponibles
+└── main.py                   # point d'entrée uvicorn
 ```
 
-Cette structure est indicative.
-
-La structure définitive sera mise en place lors des tickets de fondation.
+Cette organisation correspond à ce qui existe réellement dans le dépôt (vérifié par `find . -name "*.py"`), pas à la structure indicative `app/...` envisagée au cadrage.
 
 ---
 
-# 22. Décisions d’architecture retenues
+# 20. Choix techniques justifiés
 
-Les décisions suivantes sont retenues :
+## 20.1 FastAPI + Pydantic v2 pour l'API et tous les contrats de données
 
-* SmartData Generator est un projet indépendant ;
-* l’API est développée avec FastAPI ;
-* LangGraph orchestre le workflow ;
-* LangChain facilite l’intégration LLM et RAG ;
-* ChromaDB stocke les embeddings documentaires ;
-* PostgreSQL stocke les données internes ;
-* le Schema Analyzer constitue la source de vérité technique ;
-* le RAG fournit uniquement le contexte métier ;
-* le LLM est encapsulé derrière une interface ;
-* les sorties critiques sont structurées ;
-* les connecteurs sont indépendants du moteur IA ;
-* le Preview est le mode par défaut ;
-* l’Insert nécessite une demande explicite ;
-* le Validation Engine bloque les écritures invalides ;
-* aucun SQL généré librement par le LLM n’est exécuté ;
-* les opérations PostgreSQL sont transactionnelles ;
-* chaque exécution produit un rapport ;
-* aucune règle Pricing Control Tower n’est intégrée au cœur.
+**Choix.** FastAPI comme framework HTTP, Pydantic v2 comme unique mécanisme de validation de données dans tout le projet (requêtes API, `domain/`, sorties LLM structurées, configuration).
+**Justification.** Un seul mécanisme de validation, du contrat HTTP jusqu'à la sortie du LLM, évite la duplication de règles de validation entre couches. `with_structured_output` (LangChain) s'appuie nativement sur des modèles Pydantic, ce qui permet de réutiliser le même `EntitySpec → build_entity_model()` à la fois pour valider l'entrée API et pour contraindre la sortie du LLM — sans cela, il aurait fallu maintenir deux schémas en parallèle.
+
+## 20.2 SQLAlchemy Core (pas d'ORM) pour tout accès PostgreSQL
+
+**Choix.** `sqlalchemy` est utilisé en mode Core (`Table`, `select`, `insert`, `update`) partout — stockage interne (`persistence/`) comme insertion dans une base cible (`connectors/postgres/data_writer.py`) — jamais l'ORM déclaratif (`declarative_base`, sessions).
+**Justification.** L'insertion cible (`data_writer.py`) doit fonctionner sur un schéma **inconnu à l'avance** (fourni par l'appelant à l'exécution) : `Table(table, MetaData(), autoload_with=engine)` reflète la table au moment de l'appel, ce qu'un mapping ORM statique ne permet pas nativement. Utiliser Core partout (plutôt que Core pour la cible et ORM pour l'interne) évite de maintenir deux façons différentes d'écrire des requêtes SQL dans le même projet.
+
+## 20.3 psycopg (v3) comme driver PostgreSQL
+
+**Choix.** `postgresql+psycopg://` (psycopg 3, pas `psycopg2`).
+**Justification.** Support natif de Python 3.12+ et de l'API asynchrone (non utilisée aujourd'hui mais laissant la porte ouverte), maintenance active, recommandé par SQLAlchemy 2.x pour les nouveaux projets.
+
+## 20.4 LangGraph limité au micro-workflow de génération, pas à l'orchestration globale
+
+**Choix.** Un seul graphe LangGraph (§9), circonscrit à RAG → génération LLM → validation. Le dispatch Preview/Export/Insert (`execution_service.py`) reste du Python simple, pas un graphe.
+**Justification.** LangGraph apporte de la valeur là où il y a un vrai enchaînement conditionnel avec état partagé et retries potentiels (récupération de contexte, génération, validation — trois étapes qui peuvent échouer indépendamment et doivent router différemment selon le résultat). Le dispatch Preview/Export/Insert, lui, est un simple `if/elif` sur un champ `mode` connu à l'avance : le formaliser en graphe n'aurait ajouté que de la complexité (état à sérialiser, nœuds à tester séparément) sans bénéfice, pour un besoin qui reste un dispatcher classique.
+
+## 20.5 Groq comme fournisseur LLM
+
+**Choix.** `langchain-groq` / `ChatGroq`, modèle `llama-3.3-70b-versatile`.
+**Justification.** Latence d'inférence très basse (LPU Groq), gratuit en usage POC dans les limites du tier utilisé, et `with_structured_output` fonctionne de façon fiable avec ce modèle. L'abstraction (`infrastructure/llm.py`) limite le coût d'un changement de fournisseur à un seul fichier.
+
+## 20.6 Ollama (local) + ChromaDB pour le RAG
+
+**Choix.** Embeddings via `langchain-ollama` (modèle `bge-m3`, exécuté localement), stockage vectoriel via `chromadb.HttpClient`.
+**Justification.** Ollama local évite d'envoyer la documentation métier (potentiellement sensible) à un service tiers pour le seul calcul d'embeddings, et élimine un coût par appel. ChromaDB est simple à opérer en local (`docker-compose`), suffisant pour le volume documentaire d'un POC, et son API Python est directe (pas de couche d'abstraction supplémentaire nécessaire pour ce périmètre).
+**Limite assumée** : le modèle d'embeddings doit être pré-téléchargé sur l'instance Ollama (`ollama pull bge-m3`) — une dépendance d'environnement documentée dans [`docs/03_validation/service_validation_report.md`](../03_validation/service_validation_report.md) §2.1.
+
+## 20.7 Connecteurs = fonctions, pas de Connector Registry ni d'interfaces abstraites
+
+**Choix.** Chaque connecteur expose des fonctions simples (`read_csv`, `write_json`, `insert_records`, ...), sélectionnées par import direct plutôt que via un registre dynamique.
+**Justification.** Avec quatre connecteurs fixes et un nombre de capacités limité (§10.1), un registre + des interfaces abstraites (`BaseConnector`, `DataWriter`, ...) auraient ajouté une indirection sans bénéfice mesurable pour ce périmètre : personne n'instancie de connecteur dynamiquement au runtime aujourd'hui. Ce choix est documenté comme dette délibérée (§21) : le jour où un connecteur devient sélectionnable dynamiquement depuis la configuration d'un projet, un registre redevient justifié.
+
+## 20.8 Exécution synchrone (pas de file d'attente / worker asynchrone)
+
+**Choix.** `POST /executions` exécute génération + validation + écriture de façon synchrone dans la requête HTTP, sans file de messages ni worker en arrière-plan.
+**Justification.** Les volumes visés par le POC (`GenerationRequest.count` plafonné à 50, `domain/generation.py::_MAX_COUNT`) et la latence Groq restent compatibles avec un aller-retour HTTP classique. Une file asynchrone (Celery, RQ, ARQ...) aurait ajouté un composant d'infrastructure supplémentaire à opérer et tester, pour un gain non nécessaire à ce stade (voir §21 pour la trajectoire si les volumes augmentent).
+
+## 20.9 uv comme gestionnaire de dépendances, ruff comme linter, semantic-release pour le versioning
+
+**Choix.** `pyproject.toml` + `uv` (résolution et environnement), `ruff` (lint, exécuté en CI), `python-semantic-release` (versioning automatique à partir des messages de commit conventionnels, déclenché sur push vers `main`).
+**Justification.** Chaîne d'outils cohérente et rapide (uv), qui élimine la dérive entre environnement local et CI (`uv sync` exact sur les deux) — c'est d'ailleurs l'absence de cette synchronisation qui a été identifiée comme cause de l'échec initial de la suite de tests (cf. [`docs/03_validation/service_validation_report.md`](../03_validation/service_validation_report.md) §2). Le versioning automatique évite les oublis de bump de version manuels sur un projet à cadence de commits élevée.
+
+## 20.10 Séparation stricte entre base interne et base cible
+
+**Choix.** `infrastructure/database.py::get_engine()` (base interne, `DATABASE_URL`) et `insert_records(database_url=...)` (base cible, fournie dans la requête `ExecutionRequest.insert_target`) n'ont aucun code ni configuration en commun.
+**Justification.** Empêche structurellement qu'une opération applicative interne (sauvegarde d'un projet, d'un rapport) puisse accidentellement écrire dans la base d'un client, et inversement qu'une insertion cible ne puisse jamais toucher aux tables internes du service — la fonction `insert_records` ne connaît même pas l'existence des tables `projects`/`execution_reports`.
 
 ---
 
-# 23. Critères de validation de l’architecture
+# 21. Évolutivité — ce qu'il reste à faire pour rejoindre la cible du cadrage
 
-L’architecture est considérée comme validée lorsque :
+Pour repartir de l'implémentation actuelle vers la cible complète décrite en cadrage, dans l'ordre de valeur/complexité :
 
-* tous les composants sont identifiés ;
-* les responsabilités sont claires ;
-* les flux sont documentés ;
-* le rôle du RAG est défini ;
-* le rôle du LLM est délimité ;
-* le rôle de LangGraph est défini ;
-* le rôle de ChromaDB est défini ;
-* les connecteurs sont indépendants ;
-* les niveaux de validation sont documentés ;
-* les flux Preview, Export et Insert sont décrits ;
-* l’insertion est sécurisée ;
-* le stockage interne est distinct des bases cibles ;
-* les diagrammes sont présents ;
-* aucune logique Pricing Control Tower n’est intégrée ;
-* l’architecture permet l’ajout de nouveaux connecteurs ;
-* l’architecture permet le remplacement des fournisseurs IA.
+1. **Chaîner Project Service → Execution Service** : charger `ProjectConfig.entities`/`rules` automatiquement depuis un `project_id` plutôt que de les répéter dans chaque `GenerationRequest`.
+2. **Exposer le pipeline RAG en API** : routes d'upload de document et de déclenchement d'indexation (`rag/indexing.py` existe déjà, il manque la façade HTTP).
+3. **Relier l'analyse de schéma à la génération** : utiliser `DatabaseSchema` (issu de `/schema/postgres`) pour construire automatiquement des `EntitySpec`, dans l'ordre donné par `generation_order`.
+4. **Introduire un Connector Registry** si/quand le choix du connecteur doit devenir dynamique (piloté par `ProjectConfig.source.type` au lieu d'un import direct).
+5. **Ajouter la lecture de données existantes** côté PostgreSQL (pour PREVIEW-04 : éviter les conflits d'unicité avec des données déjà présentes).
+6. **Passer à un modèle asynchrone** si les volumes ou le nombre d'exécutions concurrentes dépassent ce que le mode synchrone actuel absorbe confortablement.
 
 ---
 
-# 24. Conclusion
+# 22. Limites de l'implémentation actuelle
 
-L’architecture de SmartData Generator repose sur une séparation stricte entre :
+En plus des limites de périmètre déjà actées au cadrage (pas de NoSQL, pas de Big Data, pas de streaming, écriture REST hors périmètre, etc. — inchangées), les limites suivantes sont spécifiques à l'état actuel du code :
 
-* le pilotage applicatif ;
-* l’orchestration IA ;
-* l’analyse technique ;
-* la recherche documentaire ;
-* la génération ;
-* la validation ;
-* les connecteurs ;
-* les opérations d’écriture.
+* pas de gestion d'utilisateurs ni d'authentification sur l'API (`api/app.py` n'a aucun middleware d'auth) ;
+* pas de pagination sur `list_all_projects` / `list_execution_reports` ;
+* le volume de génération est plafonné à 50 objets par requête (`domain/generation.py::_MAX_COUNT`) ;
+* aucune reprise après échec partiel autre que le rollback transactionnel PostgreSQL (pas de file de retry) ;
+* le modèle d'embeddings RAG doit être provisionné manuellement sur l'instance Ollama utilisée (aucune vérification automatique au démarrage).
 
-Le Schema Analyzer fournit la vérité technique.
+---
 
-Le RAG fournit le contexte métier.
+# 23. Décisions d'architecture retenues (mises à jour)
 
-Le LLM aide à interpréter, planifier et générer.
+* SmartData Generator reste un projet indépendant, sans logique Pricing Control Tower dans le cœur ;
+* FastAPI pour l'API, Pydantic v2 pour tous les contrats de données ;
+* SQLAlchemy Core (pas d'ORM) + psycopg3 pour tout accès PostgreSQL, interne comme cible ;
+* LangGraph limité au micro-workflow de génération (RAG → LLM → validation), pas à l'orchestration globale du service ;
+* Groq pour le LLM, Ollama + ChromaDB pour le RAG, chacun encapsulé derrière une interface d'un seul fichier (`infrastructure/llm.py`, `infrastructure/embeddings.py`) ;
+* connecteurs sous forme de fonctions simples, sans registre ni interfaces abstraites, choix documenté comme dette délibérée ;
+* le Validation Engine est 100 % déterministe, le LLM n'y participe jamais ;
+* Preview reste le mode par défaut ; Export et Insert exigent la même génération validée en amont ; Insert exige en plus une cible explicite et une confirmation explicite ;
+* toute exécution (succès ou échec) produit un rapport persistant, y compris quand la persistance elle-même échoue (le résultat métier n'est jamais perdu pour autant) ;
+* exécution synchrone, sans file de messages ni worker asynchrone, adaptée au volume actuel du POC ;
+* uv + ruff + semantic-release pour la chaîne d'outillage et le versioning.
 
-LangGraph contrôle le déroulement du workflow.
+---
 
-Le Validation Engine vérifie les résultats.
+# 24. Critères de validation de ce document
 
-Les connecteurs assurent les échanges avec les systèmes externes.
+Ce document est considéré comme à jour lorsque :
 
-L’Insert Service contrôle les opérations d’écriture.
+* chaque composant décrit correspond à un fichier réellement présent dans le dépôt (vérifié section par section) ;
+* les écarts avec le cadrage initial sont explicitement listés, pas seulement omis (§0, §6) ;
+* au moins un diagramme illustre l'architecture globale, le graphe de génération, et le flux Preview/Export/Insert (§7, §9, §12, §13) ;
+* chaque choix technique significatif (§20) est justifié par une raison concrète, pas seulement énoncé ;
+* les limites et la trajectoire d'évolution sont explicites plutôt qu'implicites (§21, §22).
 
-Cette architecture permet de construire un POC modulaire, maintenable, testable et réutilisable dans plusieurs domaines fonctionnels.
+---
+
+# 25. Conclusion
+
+L'architecture réellement construite est plus simple que celle envisagée au cadrage, par choix assumé plutôt que par raccourci non documenté : un dispatcher applicatif direct pour Preview/Export/Insert, un unique graphe LangGraph circonscrit à la génération, des connecteurs sous forme de fonctions plutôt que d'interfaces abstraites, une exécution synchrone plutôt qu'asynchrone.
+
+Les invariants de sécurité et de fiabilité du cadrage sont, eux, intégralement respectés dans le code : Preview par défaut, aucune écriture implicite, confirmation explicite avant Insert, validation déterministe avant toute écriture, transactions PostgreSQL avec rollback automatique, traçabilité systématique par rapport d'exécution.
+
+Ce document (§21) trace explicitement le chemin restant pour rejoindre la cible complète du cadrage — chaînage Project → Execution, exposition du RAG en API, rapprochement schéma ↔ génération — sans que cela remette en cause la structure actuelle, conçue pour absorber ces évolutions de façon additive.
