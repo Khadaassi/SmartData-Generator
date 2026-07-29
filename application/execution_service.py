@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from pathlib import Path
 
 from agents.generation_agent import run_generation
@@ -5,8 +6,11 @@ from connectors.output import DataWriterError, write_csv, write_json
 from connectors.postgres import DataWriteError, insert_records
 from domain.execution import ExecutionRequest, ExecutionResult, InsertReport
 from domain.generation import GenerationError, GenerationResult
+from domain.report import ExecutionReport
 from infrastructure.config import get_settings
 from infrastructure.logging import get_logger
+from reporting.report_builder import build_execution_report
+from reporting.report_service import save_execution_report
 
 logger = get_logger(__name__)
 
@@ -31,7 +35,32 @@ def _build_export_path(run_id: str, entity: str, export_format: str) -> Path:
 def execute(request: ExecutionRequest) -> ExecutionResult:
     """Exécute une génération dans le mode demandé (Preview, Export ou Insert).
 
-    Preview est le comportement par défaut et ne modifie jamais un système externe.
+    Chaque exécution produit systématiquement un rapport détaillé (durée, volumes,
+    erreurs) enregistré indépendamment du résultat métier, pour assurer la
+    traçabilité des traitements (cf. technical_architecture.md section 6.29).
+    """
+    started_at = datetime.now(UTC)
+    result = _dispatch(request)
+    finished_at = datetime.now(UTC)
+
+    _record_execution_report(request, result, started_at, finished_at)
+
+    return result
+
+
+def _record_execution_report(
+    request: ExecutionRequest, result: ExecutionResult, started_at: datetime, finished_at: datetime
+) -> None:
+    report: ExecutionReport = build_execution_report(request, result, started_at, finished_at)
+    try:
+        save_execution_report(report)
+    except Exception:
+        logger.exception("[%s] échec de l'enregistrement du rapport d'exécution", report.run_id)
+
+
+def _dispatch(request: ExecutionRequest) -> ExecutionResult:
+    """Preview est le comportement par défaut et ne modifie jamais un système externe.
+
     Export et Insert réutilisent le même résultat de génération/validation puis
     ajoutent une opération d'écriture propre, chacune avec ses propres contrôles.
     """
@@ -56,14 +85,14 @@ def execute(request: ExecutionRequest) -> ExecutionResult:
         )
         return ExecutionResult(run_id=run_id, mode=request.mode, status="VALIDATION_FAILED", generation=generation_result)
 
-    report = generation_result.validation_report
-    if report is not None and report.rejected_items:
+    validation_report = generation_result.validation_report
+    if validation_report is not None and validation_report.rejected_items:
         logger.warning(
             "[%s] mode=%s : %d/%d objet(s) rejeté(s) par la validation, poursuite avec %d objet(s) valide(s)",
             run_id,
             request.mode,
-            report.rejected_items,
-            report.total_items,
+            validation_report.rejected_items,
+            validation_report.total_items,
             len(generation_result.items),
         )
 

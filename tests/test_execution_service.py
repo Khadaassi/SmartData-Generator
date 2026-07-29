@@ -1,11 +1,21 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from application.execution_service import execute
 from connectors.postgres import DataWriteError
 from domain.execution import ExecutionRequest, PostgresInsertTarget
 from domain.generation import GenerationRequest, GenerationResult
 from domain.schema import EntitySpec, FieldSpec
+
+
+@pytest.fixture(autouse=True)
+def _no_report_persistence(monkeypatch):
+    # La persistance du rapport touche la base interne : hors de portée de ces tests unitaires,
+    # qui portent sur le comportement des modes eux-mêmes (cf. test_report_builder.py /
+    # tests/integration/test_report_repository.py pour le rapport lui-même).
+    monkeypatch.setattr("application.execution_service.save_execution_report", lambda report: None)
 
 
 def _entity() -> EntitySpec:
@@ -176,3 +186,34 @@ def test_insert_mode_reports_rollback_as_failure(monkeypatch):
     assert result.status == "FAILED"
     assert result.insert_report is None
     assert any(error.code == "integrity_error" for error in result.generation.errors)
+
+
+# --- Rapport d'exécution ---
+
+
+def test_execute_builds_and_persists_a_report_for_every_call(monkeypatch):
+    _patch_generation(monkeypatch, _success_result())
+    captured = {}
+    monkeypatch.setattr("application.execution_service.save_execution_report", lambda report: captured.setdefault("report", report))
+
+    result = execute(ExecutionRequest(generation=_generation_request(), mode="PREVIEW"))
+
+    report = captured["report"]
+    assert report.run_id == result.run_id
+    assert report.mode == "PREVIEW"
+    assert report.status == "READY"
+    assert report.duration_seconds >= 0
+    assert report.requested_count == 2
+
+
+def test_execute_still_returns_a_result_when_report_persistence_fails(monkeypatch):
+    _patch_generation(monkeypatch, _success_result())
+
+    def _raise(report):
+        raise RuntimeError("base interne indisponible")
+
+    monkeypatch.setattr("application.execution_service.save_execution_report", _raise)
+
+    result = execute(ExecutionRequest(generation=_generation_request(), mode="PREVIEW"))
+
+    assert result.status == "READY"  # le résultat métier n'est pas affecté par l'échec du rapport

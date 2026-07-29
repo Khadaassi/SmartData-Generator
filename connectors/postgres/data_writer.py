@@ -20,11 +20,14 @@ def insert_records(
         raise DataWriteError(code="no_data", message="Aucun enregistrement à insérer.")
 
     owns_engine = engine is None
-    db_engine = engine or create_engine(database_url)
+    db_engine = engine
 
     try:
         try:
+            db_engine = db_engine or create_engine(database_url)
             target_table = Table(table, MetaData(), schema=schema, autoload_with=db_engine)
+        except OperationalError as exc:
+            raise DataWriteError(code="connection_error", message=f"Connexion PostgreSQL impossible : {exc}") from exc
         except SQLAlchemyError as exc:
             raise DataWriteError(
                 code="table_not_found", message=f"Table '{schema}.{table}' introuvable : {exc}"
@@ -53,7 +56,7 @@ def insert_records(
                 code="insert_error", message=f"Erreur lors de l'insertion dans '{table}' : {exc}"
             ) from exc
     finally:
-        if owns_engine:
+        if owns_engine and db_engine is not None:
             db_engine.dispose()
 
     return len(items)
