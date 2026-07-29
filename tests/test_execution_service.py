@@ -7,6 +7,7 @@ from application.execution_service import execute
 from connectors.postgres import DataWriteError
 from domain.execution import ExecutionRequest, PostgresInsertTarget
 from domain.generation import GenerationRequest, GenerationResult
+from domain.project import ProjectConfig
 from domain.schema import EntitySpec, FieldSpec
 
 
@@ -16,6 +17,14 @@ def _no_report_persistence(monkeypatch):
     # qui portent sur le comportement des modes eux-mêmes (cf. test_report_builder.py /
     # tests/integration/test_report_repository.py pour le rapport lui-même).
     monkeypatch.setattr("application.execution_service.save_execution_report", lambda report: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_project_lookup(monkeypatch):
+    # Ces tests portent sur le comportement des modes (Preview/Export/Insert), pas sur les
+    # règles métier d'un projet réel (cf. test_api_executions.py pour la fusion des règles) :
+    # un projet vide évite d'avoir à créer une vraie ligne projet ici.
+    monkeypatch.setattr("application.execution_service.load_project_config", lambda project_id: ProjectConfig())
 
 
 def _entity() -> EntitySpec:

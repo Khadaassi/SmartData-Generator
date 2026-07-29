@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from agents.generation_agent import run_generation
+from application.project_service import load_project_config
 from connectors.output import DataWriterError, write_csv, write_json
 from connectors.postgres import DataWriteError, insert_records
 from domain.execution import ExecutionRequest, ExecutionResult, InsertReport
@@ -32,6 +33,17 @@ def _build_export_path(run_id: str, entity: str, export_format: str) -> Path:
     return directory / f"{entity}_{run_id}.{export_format}"
 
 
+def _with_project_rules(request: ExecutionRequest) -> ExecutionRequest:
+    """Substitue les règles de la requête par celles persistées sur le projet.
+
+    Les règles métier sont une propriété du projet (gérée via l'interface, cf.
+    `application/project_service.py::update_project_config`), pas un paramètre
+    que chaque appelant doit se souvenir de fournir à chaque exécution.
+    """
+    project_rules = load_project_config(request.generation.project_id).rules
+    return request.model_copy(update={"generation": request.generation.model_copy(update={"rules": project_rules})})
+
+
 def execute(request: ExecutionRequest) -> ExecutionResult:
     """Exécute une génération dans le mode demandé (Preview, Export ou Insert).
 
@@ -39,6 +51,7 @@ def execute(request: ExecutionRequest) -> ExecutionResult:
     erreurs) enregistré indépendamment du résultat métier, pour assurer la
     traçabilité des traitements (cf. technical_architecture.md section 6.29).
     """
+    request = _with_project_rules(request)
     started_at = datetime.now(UTC)
     result = _dispatch(request)
     finished_at = datetime.now(UTC)

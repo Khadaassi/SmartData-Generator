@@ -8,11 +8,9 @@ LAST_PAYLOAD = "sdg_last_payload"
 LAST_RESULT = "sdg_last_result"
 LAST_DURATION = "sdg_last_duration"
 
-DEMO_PROJECT_ID = "pricing-control-tower-demo"
-
 _DEFAULTS = {
     API_AVAILABLE: None,
-    PROJECT_ID: DEMO_PROJECT_ID,
+    PROJECT_ID: None,
     SCHEMA_RESULT: None,
     SELECTED_ENTITY: None,
     LAST_PAYLOAD: None,

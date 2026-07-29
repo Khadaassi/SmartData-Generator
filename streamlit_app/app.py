@@ -1,3 +1,10 @@
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import streamlit as st
 
 from streamlit_app.api_client import get_api_client
@@ -34,7 +41,7 @@ Utilisez le menu à gauche pour suivre le parcours :
 """
 )
 
-render_project_selector()
+render_project_selector(client)
 
 if not api_available:
     st.error(

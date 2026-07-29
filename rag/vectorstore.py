@@ -47,6 +47,17 @@ def upsert_chunks(chunks: list[tuple[str, ChunkMetadata]]) -> int:
     return len(ids)
 
 
+def delete_document(project_id: str, document_id: str) -> None:
+    """Supprime tous les chunks d'un document donné pour un projet."""
+    get_collection().delete(where={"$and": [{"project_id": project_id}, {"document_id": document_id}]})
+
+
+def list_documents(project_id: str) -> list[str]:
+    """Liste les identifiants de document distincts indexés pour un projet."""
+    result = get_collection().get(where={"project_id": project_id}, include=["metadatas"])
+    return sorted({metadata["document_id"] for metadata in result["metadatas"]})
+
+
 @dataclass
 class SearchResult:
     text: str

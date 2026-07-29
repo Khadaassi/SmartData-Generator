@@ -40,7 +40,29 @@ class ApiClient:
     def execute_generation(self, payload: dict) -> dict[str, Any]:
         return self._request("POST", "/executions", json=payload)
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+    def create_project(self, payload: dict) -> dict[str, Any]:
+        return self._request("POST", "/projects", json=payload)
+
+    def list_projects(self) -> list[dict[str, Any]]:
+        return self._request("GET", "/projects")
+
+    def get_project(self, project_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/projects/{project_id}")
+
+    def update_project_rules(self, project_id: str, rules: list[dict]) -> dict[str, Any]:
+        return self._request("PUT", f"/projects/{project_id}/rules", json={"rules": rules})
+
+    def upload_documents(self, project_id: str, files: list[tuple[str, bytes]]) -> dict[str, Any]:
+        multipart_files = [("files", (name, content, "text/markdown")) for name, content in files]
+        return self._request("POST", f"/projects/{project_id}/documents", files=multipart_files)
+
+    def list_documents(self, project_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/projects/{project_id}/documents")
+
+    def delete_document(self, project_id: str, filename: str) -> None:
+        self._request("DELETE", f"/projects/{project_id}/documents/{filename}")
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         try:
             response = self._client.request(method, path, **kwargs)
         except httpx.TimeoutException as exc:
@@ -65,7 +87,7 @@ class ApiClient:
         if response.status_code >= 400:
             raise _map_error_response(response)
 
-        return response.json()
+        return response.json() if response.content else {}
 
 
 def _map_error_response(response: httpx.Response) -> SmartDataGeneratorApiError:

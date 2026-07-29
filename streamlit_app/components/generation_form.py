@@ -30,6 +30,10 @@ def render_generation_form(client: ApiClient) -> None:
     table = _render_entity_selection(tables)
 
     st.subheader("Génération")
+    st.caption(
+        "Les documents indexés et les règles métier du projet (page Project) sont "
+        "appliqués automatiquement à la recherche RAG et à la validation."
+    )
     project_id = st.session_state.get(state.PROJECT_ID, "")
     count = st.number_input("Nombre d'enregistrements", min_value=1, max_value=_MAX_COUNT, value=5, step=1)
     context_query = st.text_area("Instructions complémentaires (optionnel)", value="")

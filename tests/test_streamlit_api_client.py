@@ -143,3 +143,87 @@ def test_execute_generation_insert_without_confirmation_passes_through_failed_st
 
     assert result["status"] == "FAILED"
     assert result["generation"]["errors"][0]["code"] == "insert_not_confirmed"
+
+
+def test_create_project_success():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/projects"
+        assert request.method == "POST"
+        return httpx.Response(201, json={"id": "proj-1", "name": "Pricing", "description": None, "is_active": True})
+
+    client = _client(handler)
+    project = client.create_project({"name": "Pricing"})
+
+    assert project["id"] == "proj-1"
+
+
+def test_list_projects_success():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/projects"
+        return httpx.Response(200, json=[{"id": "proj-1", "name": "Pricing"}])
+
+    client = _client(handler)
+    projects = client.list_projects()
+
+    assert projects == [{"id": "proj-1", "name": "Pricing"}]
+
+
+def test_get_project_404_raises_readable_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"code": "project_not_found", "message": "Projet introuvable : proj-1"})
+
+    client = _client(handler)
+
+    with pytest.raises(SmartDataGeneratorApiError) as exc_info:
+        client.get_project("proj-1")
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.message == "Projet introuvable : proj-1"
+
+
+def test_update_project_rules_sends_rules_payload():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/projects/proj-1/rules"
+        assert request.method == "PUT"
+        return httpx.Response(200, json={"id": "proj-1", "config": {"rules": [{"id": "r1"}]}})
+
+    client = _client(handler)
+    project = client.update_project_rules("proj-1", [{"id": "r1"}])
+
+    assert project["config"]["rules"] == [{"id": "r1"}]
+
+
+def test_upload_documents_sends_multipart_request():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/projects/proj-1/documents"
+        assert request.headers["content-type"].startswith("multipart/form-data")
+        assert b"filename=\"regles.md\"" in request.content
+        assert b"contenu de test" in request.content
+        return httpx.Response(200, json={"uploaded": [{"filename": "regles.md", "chunks_indexed": 1}]})
+
+    client = _client(handler)
+    result = client.upload_documents("proj-1", [("regles.md", b"contenu de test")])
+
+    assert result["uploaded"][0]["chunks_indexed"] == 1
+
+
+def test_list_documents_success():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/projects/proj-1/documents"
+        return httpx.Response(200, json={"documents": ["regles_client"]})
+
+    client = _client(handler)
+    result = client.list_documents("proj-1")
+
+    assert result == {"documents": ["regles_client"]}
+
+
+def test_delete_document_handles_empty_204_body():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/projects/proj-1/documents/regles_client.md"
+        assert request.method == "DELETE"
+        return httpx.Response(204)
+
+    client = _client(handler)
+
+    client.delete_document("proj-1", "regles_client.md")  # ne lève pas
