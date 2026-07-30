@@ -90,6 +90,18 @@ class ApiClient:
             data=data,
         )
 
+    def import_rest_data(
+        self, *, source: dict, database_url: str, schema_name: str, table: str, confirm: bool
+    ) -> dict[str, Any]:
+        payload = {
+            "source": source,
+            "database_url": database_url,
+            "schema_name": schema_name,
+            "table": table,
+            "confirm": confirm,
+        }
+        return self._request("POST", "/data-import/rest", json=payload)
+
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         try:
             response = self._client.request(method, path, **kwargs)

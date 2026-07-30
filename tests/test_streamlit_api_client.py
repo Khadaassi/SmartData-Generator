@@ -262,6 +262,49 @@ def test_import_data_400_raises_readable_error():
     assert exc_info.value.message == "Fichier CSV vide"
 
 
+def test_import_rest_data_sends_source_and_confirmation():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/data-import/rest"
+        import json as _json
+
+        captured["body"] = _json.loads(request.content)
+        return httpx.Response(200, json={"table": "meteo", "schema_name": "public", "rows_read": 1, "rows_inserted": 1})
+
+    client = _client(handler)
+    result = client.import_rest_data(
+        source={"url": "https://api.exemple.com/villes", "data_path": "data.items"},
+        database_url="postgresql+psycopg://u:p@localhost/db",
+        schema_name="public",
+        table="meteo",
+        confirm=True,
+    )
+
+    assert result["rows_inserted"] == 1
+    assert captured["body"]["source"]["url"] == "https://api.exemple.com/villes"
+    assert captured["body"]["confirm"] is True
+    assert captured["body"]["table"] == "meteo"
+
+
+def test_import_rest_data_422_raises_readable_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"detail": "L'import nécessite une confirmation explicite (confirm=true)."})
+
+    client = _client(handler)
+
+    with pytest.raises(SmartDataGeneratorApiError) as exc_info:
+        client.import_rest_data(
+            source={"url": "https://api.exemple.com/villes"},
+            database_url="postgresql+psycopg://u:p@localhost/db",
+            schema_name="public",
+            table="meteo",
+            confirm=False,
+        )
+
+    assert exc_info.value.status_code == 422
+
+
 def test_delete_document_handles_empty_204_body():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/projects/proj-1/documents/regles_client.md"

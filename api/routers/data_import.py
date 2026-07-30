@@ -3,9 +3,9 @@ from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from api.schemas.data_import import ImportResult
+from api.schemas.data_import import ImportResult, RestImportRequest
 from api.schemas.errors import ErrorResponse
-from connectors.input import read_csv, read_json
+from connectors.input import read_csv, read_json, read_rest
 from connectors.postgres import insert_records
 
 router = APIRouter(prefix="/data-import", tags=["data-import"])
@@ -86,3 +86,25 @@ async def import_json(
         records = read_json(Path(tmp.name))
 
     return _insert(records, database_url=database_url, schema_name=schema_name, table=table)
+
+
+@router.post(
+    "/rest",
+    response_model=ImportResult,
+    summary="Importer les données d'une API REST directement dans une table PostgreSQL",
+    description=(
+        "Interroge une API REST (URL, méthode, en-têtes, authentification et chemin "
+        "d'extraction fournis explicitement dans `source`, aucun n'est supposé par défaut) "
+        "et insère les enregistrements obtenus tels quels dans la table cible, sans passer "
+        "par la génération LLM : destiné à charger des données déjà correctes (ex. un "
+        "référentiel ou une API tierce). L'import n'est jamais implicite : il exige une "
+        "confirmation explicite (confirm=true)."
+    ),
+    responses=_RESPONSES,
+)
+def import_rest(request: RestImportRequest) -> ImportResult:
+    _require_confirmation(request.confirm)
+
+    records = read_rest(request.source)
+
+    return _insert(records, database_url=request.database_url, schema_name=request.schema_name, table=request.table)
