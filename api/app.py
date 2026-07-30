@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 
 from api.errors import register_exception_handlers
-from api.routers import executions, health, schema_analysis
+from api.routers import data_import, documents, executions, health, projects, schema_analysis
 from infrastructure.config import get_project_version
 from infrastructure.logging import configure_logging
 
@@ -20,6 +20,9 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(executions.router)
     app.include_router(schema_analysis.router)
+    app.include_router(projects.router)
+    app.include_router(documents.router)
+    app.include_router(data_import.router)
 
     return app
 

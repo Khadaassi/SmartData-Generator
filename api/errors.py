@@ -2,7 +2,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from api.schemas.errors import ErrorResponse
-from connectors.postgres import SchemaReaderError
+from application.document_service import DocumentValidationError
+from application.project_service import ProjectNotFoundError
+from connectors.input import DataReaderError
+from connectors.postgres import DataWriteError, SchemaReaderError
 from infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
@@ -11,6 +14,9 @@ logger = get_logger(__name__)
 # (code) reste disponible dans le corps de la réponse pour un traitement fin côté client.
 _STATUS_BY_EXCEPTION: dict[type[Exception], int] = {
     SchemaReaderError: 502,
+    ProjectNotFoundError: 404,
+    DataReaderError: 400,
+    DataWriteError: 502,
 }
 
 
@@ -23,6 +29,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     """
     for exc_type, status_code in _STATUS_BY_EXCEPTION.items():
         app.add_exception_handler(exc_type, _connector_error_handler(status_code))
+    app.add_exception_handler(DocumentValidationError, _document_validation_error_handler)
     app.add_exception_handler(Exception, _unexpected_error_handler)
 
 
@@ -34,6 +41,18 @@ def _connector_error_handler(status_code: int):
         )
 
     return handler
+
+
+async def _document_validation_error_handler(request: Request, exc: DocumentValidationError) -> JSONResponse:
+    logger.warning("%s %s -> document(s) invalide(s) : %s", request.method, request.url.path, exc.errors)
+    return JSONResponse(
+        status_code=422,
+        content={
+            "code": "invalid_documents",
+            "message": "Un ou plusieurs documents sont invalides.",
+            "errors": exc.errors,
+        },
+    )
 
 
 async def _unexpected_error_handler(request: Request, exc: Exception) -> JSONResponse:
