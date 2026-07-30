@@ -7,6 +7,7 @@ from sqlalchemy.engine import make_url
 from application.execution_service import execute
 from domain.execution import ExecutionRequest
 from domain.generation import GenerationRequest, GenerationResult
+from domain.project import ProjectConfig
 from domain.schema import EntitySpec, FieldSpec
 from infrastructure.config import get_settings
 from persistence.tables import create_all
@@ -42,6 +43,7 @@ def test_execute_persists_a_retrievable_report(monkeypatch):
         )
 
     monkeypatch.setattr("application.execution_service.run_generation", _fake_run_generation)
+    monkeypatch.setattr("application.execution_service.load_project_config", lambda project_id: ProjectConfig())
 
     entity = EntitySpec(name="Produit", fields=[FieldSpec(name="nom", type="string")])
     generation_request = GenerationRequest(project_id="proj-e2e", entity=entity, count=1)

@@ -17,7 +17,9 @@ logger = get_logger(__name__)
 class ProjectNotFoundError(Exception):
     def __init__(self, project_id: str):
         self.project_id = project_id
-        super().__init__(f"Projet introuvable : {project_id}")
+        self.code = "project_not_found"
+        self.message = f"Projet introuvable : {project_id}"
+        super().__init__(self.message)
 
 
 def create_project(name: str, *, description: str | None = None, config: ProjectConfig | None = None) -> Project:
