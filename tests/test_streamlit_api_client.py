@@ -218,6 +218,50 @@ def test_list_documents_success():
     assert result == {"documents": ["regles_client"]}
 
 
+def test_import_data_sends_multipart_request_with_confirmation():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/data-import/csv"
+        assert request.headers["content-type"].startswith("multipart/form-data")
+        assert b'name="confirm"' in request.content
+        assert b"true" in request.content
+        assert b'filename="produits.csv"' in request.content
+        return httpx.Response(200, json={"table": "produits", "schema_name": "public", "rows_read": 2, "rows_inserted": 2})
+
+    client = _client(handler)
+    result = client.import_data(
+        source_format="csv",
+        filename="produits.csv",
+        content=b"nom\nClavier\nSouris\n",
+        database_url="postgresql+psycopg://u:p@localhost/db",
+        schema_name="public",
+        table="produits",
+        confirm=True,
+    )
+
+    assert result["rows_inserted"] == 2
+
+
+def test_import_data_400_raises_readable_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"code": "empty_file", "message": "Fichier CSV vide"})
+
+    client = _client(handler)
+
+    with pytest.raises(SmartDataGeneratorApiError) as exc_info:
+        client.import_data(
+            source_format="csv",
+            filename="empty.csv",
+            content=b"",
+            database_url="postgresql+psycopg://u:p@localhost/db",
+            schema_name="public",
+            table="produits",
+            confirm=True,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.message == "Fichier CSV vide"
+
+
 def test_delete_document_handles_empty_204_body():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/projects/proj-1/documents/regles_client.md"

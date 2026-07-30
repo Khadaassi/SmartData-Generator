@@ -62,6 +62,34 @@ class ApiClient:
     def delete_document(self, project_id: str, filename: str) -> None:
         self._request("DELETE", f"/projects/{project_id}/documents/{filename}")
 
+    def import_data(
+        self,
+        *,
+        source_format: str,
+        filename: str,
+        content: bytes,
+        database_url: str,
+        schema_name: str,
+        table: str,
+        confirm: bool,
+        delimiter: str = ",",
+    ) -> dict[str, Any]:
+        content_type = "text/csv" if source_format == "csv" else "application/json"
+        data = {
+            "database_url": database_url,
+            "schema_name": schema_name,
+            "table": table,
+            "confirm": "true" if confirm else "false",
+        }
+        if source_format == "csv":
+            data["delimiter"] = delimiter
+        return self._request(
+            "POST",
+            f"/data-import/{source_format}",
+            files={"file": (filename, content, content_type)},
+            data=data,
+        )
+
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         try:
             response = self._client.request(method, path, **kwargs)

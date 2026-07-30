@@ -4,7 +4,8 @@ from fastapi.responses import JSONResponse
 from api.schemas.errors import ErrorResponse
 from application.document_service import DocumentValidationError
 from application.project_service import ProjectNotFoundError
-from connectors.postgres import SchemaReaderError
+from connectors.input import DataReaderError
+from connectors.postgres import DataWriteError, SchemaReaderError
 from infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
@@ -14,6 +15,8 @@ logger = get_logger(__name__)
 _STATUS_BY_EXCEPTION: dict[type[Exception], int] = {
     SchemaReaderError: 502,
     ProjectNotFoundError: 404,
+    DataReaderError: 400,
+    DataWriteError: 502,
 }
 
 

@@ -38,6 +38,8 @@ Utilisez le menu à gauche pour suivre le parcours :
 2. **Schema** — analyser le schéma PostgreSQL cible.
 3. **Generation** — choisir une entité et lancer une génération (Preview par défaut).
 4. **Result** — consulter le résultat, le rapport de validation et la traçabilité.
+5. **Import** — charger un fichier CSV/JSON déjà correct directement dans une table existante,
+   sans passer par le LLM (ex. données déjà collectées par ailleurs).
 """
 )
 
