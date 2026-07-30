@@ -1,5 +1,6 @@
 import tempfile
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
@@ -41,12 +42,12 @@ def _insert(records: list[dict], *, database_url: str, schema_name: str, table: 
     responses=_RESPONSES,
 )
 async def import_csv(
-    file: UploadFile = File(...),
-    database_url: str = Form(...),
-    schema_name: str = Form("public"),
-    table: str = Form(...),
-    delimiter: str = Form(","),
-    confirm: bool = Form(False),
+    file: Annotated[UploadFile, File(...)],
+    database_url: Annotated[str, Form(...)],
+    table: Annotated[str, Form(...)],
+    schema_name: Annotated[str, Form()] = "public",
+    delimiter: Annotated[str, Form()] = ",",
+    confirm: Annotated[bool, Form()] = False,
 ) -> ImportResult:
     _require_confirmation(confirm)
 
@@ -71,11 +72,11 @@ async def import_csv(
     responses=_RESPONSES,
 )
 async def import_json(
-    file: UploadFile = File(...),
-    database_url: str = Form(...),
-    schema_name: str = Form("public"),
-    table: str = Form(...),
-    confirm: bool = Form(False),
+    file: Annotated[UploadFile, File(...)],
+    database_url: Annotated[str, Form(...)],
+    table: Annotated[str, Form(...)],
+    schema_name: Annotated[str, Form()] = "public",
+    confirm: Annotated[bool, Form()] = False,
 ) -> ImportResult:
     _require_confirmation(confirm)
 
